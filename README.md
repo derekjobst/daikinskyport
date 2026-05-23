@@ -16,6 +16,32 @@ Most functions are supported. This was mostly taken from the ecobee code and mod
 - **Rapid poll after writes** — optional diagnostic switch to poll the cloud every second for 15s after each PUT
 - **Logbook** — clearer climate change entries from HA and cloud
 
+## Development
+
+Run unit tests from the repository root (no running Home Assistant instance required):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests use lightweight stubs for Home Assistant imports so you do not need a running HA instance or the full `homeassistant` package.
+
+CI runs the same suite on every push and pull request to `master` via [GitHub Actions](.github/workflows/tests.yml).
+
+This fork keeps the upstream repo as `origin` and pushes to a `fork` remote:
+
+```bash
+git remote add upstream https://github.com/apetrycki/daikinskyport.git   # once
+git fetch upstream
+git merge upstream/master
+git push fork master
+```
+
+Report issues for this fork at [derekjobst/daikinskyport/issues](https://github.com/derekjobst/daikinskyport/issues).
+
 ## Installation
 
 This component can be installed via the [Home Assistant Community Store (HACS)](https://hacs.xyz/) or manually.
@@ -53,16 +79,3 @@ After pairing the thermostat and installing the component, activate the componen
 The email and password must be the same ones that you used when you created your account in the mobile app.
 
 Once Core has restarted, navigate to **Configuration** in the sidebar, then **Entities**. Use the search box to search for the name of your thermostat. For example, search for `main room` (the name of your thermostat is shown on the touch screen). You should see a main `climate` entity, `weather`, schedule and away climate entities, and a number of `sensor` entities. Some diagnostic entities (refresh button, rapid poll switch) are disabled by default — enable them in the entity registry if needed.
-
-## Development
-
-This fork keeps the upstream repo as `origin` and pushes to a `fork` remote:
-
-```bash
-git remote add upstream https://github.com/apetrycki/daikinskyport.git   # once
-git fetch upstream
-git merge upstream/master
-git push fork master
-```
-
-Report issues for this fork at [derekjobst/daikinskyport/issues](https://github.com/derekjobst/daikinskyport/issues).

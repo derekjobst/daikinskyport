@@ -1,0 +1,3 @@
+# Dev dependencies for unit tests (no full Home Assistant install required).
+pytest>=8.0
+requests>=2.28

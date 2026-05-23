@@ -16,6 +16,16 @@ from .logbook_helpers import (
     format_temp_dual,
     format_temps_dict_for_log,
 )
+from .sync_helpers import (
+    PENDING_KEYS_KEY,
+    PENDING_UNTIL_KEY,
+    SYNC_LOG_EVENTS_KEY,
+    append_write_batch,
+    copy_pending_internal_state,
+    has_pending_write_batches,
+    merge_pending_fields,
+    reconcile_pending_batches,
+)
 
 # Temperature-related keys logged on API requests/responses (debug).
 _TEMP_LOG_KEYS = frozenset({
@@ -130,21 +140,6 @@ def _parse_response_json(response):
 NEXT_SCHEDULE = 1
 # Ignore tiny float differences when comparing active vs home setpoints.
 ACTIVE_HOME_MISMATCH_THRESHOLD = 0.15
-_PENDING_UNTIL_KEY = "_hold_pending_until"
-_PENDING_KEYS_KEY = "_pending_write_keys"
-
-
-def _pending_values_match(expected, actual) -> bool:
-    """Return True when a polled cloud value matches an optimistic write."""
-    if expected is None and actual is None:
-        return True
-    if expected is None or actual is None:
-        return False
-    if isinstance(expected, bool) or isinstance(actual, bool):
-        return expected is actual
-    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-        return abs(float(expected) - float(actual)) <= ACTIVE_HOME_MISMATCH_THRESHOLD
-    return expected == actual
 
 
 class ExpiredTokenError(Exception):
@@ -414,9 +409,17 @@ class DaikinSkyport(object):
                         )
 
                         if apply_hold_merge:
+                            sync_events = reconcile_pending_batches(
+                                old_thermostat, thermostat_info
+                            )
                             thermostat_info = self._merge_pending_writes(
                                 old_thermostat, thermostat_info
                             )
+                            copy_pending_internal_state(
+                                old_thermostat, thermostat_info
+                            )
+                            if sync_events:
+                                thermostat_info[SYNC_LOG_EVENTS_KEY] = sync_events
                         self.thermostats[index] = thermostat_info
                 if not overwrite:
                     thermostat_info['delayed_reset_timestamp'] = None
@@ -508,9 +511,13 @@ class DaikinSkyport(object):
         )
 
         if apply_hold_merge:
+            sync_events = reconcile_pending_batches(old_thermostat, thermostat_info)
             thermostat_info = self._merge_pending_writes(
                 old_thermostat, thermostat_info
             )
+            copy_pending_internal_state(old_thermostat, thermostat_info)
+            if sync_events:
+                thermostat_info[SYNC_LOG_EVENTS_KEY] = sync_events
         self.thermostats[index] = thermostat_info
         self.log_cloud_snapshot(index, context)
         return True
@@ -786,42 +793,40 @@ class DaikinSkyport(object):
 
         return result
 
+    def has_pending_writes(self, index: int) -> bool:
+        """Return True when optimistic PUT batches are awaiting cloud confirmation."""
+        if 0 <= index < len(self.thermostats):
+            return has_pending_write_batches(self.thermostats[index])
+        return False
+
     def _write_confirmed(self, pending: dict, new: dict) -> bool:
         """Return True when the cloud poll reflects all pending optimistic fields."""
+        from .sync_helpers import pending_values_match
+
         return all(
-            _pending_values_match(expected, new.get(key))
+            pending_values_match(expected, new.get(key))
             for key, expected in pending.items()
         )
 
     def _merge_pending_writes(self, old, new):
         """Keep optimistic PUT fields until the cloud API catches up."""
-        until = old.get(_PENDING_UNTIL_KEY)
-        pending = old.get(_PENDING_KEYS_KEY) or {}
+        until = old.get(PENDING_UNTIL_KEY)
+        pending = old.get(PENDING_KEYS_KEY) or {}
         if not until or time.time() > until or not pending:
             return new
         if self._write_confirmed(pending, new):
             return new
-        merged = dict(new)
-        for key, expected in pending.items():
-            if not _pending_values_match(expected, new.get(key)):
-                merged[key] = expected
-        merged[_PENDING_UNTIL_KEY] = until
-        merged[_PENDING_KEYS_KEY] = pending
+        merged = merge_pending_fields(old, new)
+        merged[PENDING_UNTIL_KEY] = until
+        merged[PENDING_KEYS_KEY] = pending
         if "_override_started_at" in old:
             merged["_override_started_at"] = old["_override_started_at"]
         return merged
 
-    def _mark_write_pending(self, index, body: dict) -> None:
+    def _mark_write_pending(self, index, body: dict, action: str) -> None:
         """Track fields from a PUT so polls do not revert the UI with stale data."""
-        if not (0 <= index < len(self.thermostats)):
-            return
-        thermostat = self.thermostats[index]
-        pending = dict(thermostat.get(_PENDING_KEYS_KEY) or {})
-        for key, value in body.items():
-            if not key.startswith("_"):
-                pending[key] = value
-        thermostat[_PENDING_KEYS_KEY] = pending
-        thermostat[_PENDING_UNTIL_KEY] = time.time() + HOLD_PENDING_SECONDS
+        if 0 <= index < len(self.thermostats):
+            append_write_batch(self.thermostats[index], body, action)
 
     def _mark_override_started(self, index) -> None:
         """Record when a timed schedule override began (for end-time display)."""
@@ -833,7 +838,7 @@ class DaikinSkyport(object):
         if 0 <= index < len(self.thermostats):
             self.thermostats[index].pop("_override_started_at", None)
 
-    def _apply_local_changes(self, index, body):
+    def _apply_local_changes(self, index, body, action: str):
         """Apply successful PUT fields to the local cache for immediate HA updates."""
         if not (0 <= index < len(self.thermostats)):
             return
@@ -846,7 +851,7 @@ class DaikinSkyport(object):
         if "cspHome" in body:
             thermostat["cspActive"] = body["cspHome"]
             pending_body["cspActive"] = body["cspHome"]
-        self._mark_write_pending(index, pending_body)
+        self._mark_write_pending(index, pending_body, action)
 
     def make_request(self, index, body, log_msg_action, *, retry_count=0):
         deviceID = self.thermostats[index]['id']
@@ -871,7 +876,7 @@ class DaikinSkyport(object):
             device_id=deviceID, data=response_data,
         )
         if request.status_code == requests.codes.ok:
-            self._apply_local_changes(index, body)
+            self._apply_local_changes(index, body, log_msg_action)
             # Avoid an immediate full fetch that can return stale data and
             # overwrite the optimistic cache; the next scheduled poll will sync.
             self.skip_next = True
