@@ -1,9 +1,30 @@
 import logging
+from datetime import timedelta
 
 _LOGGER = logging.getLogger(__package__)
 
+# Single poll interval for the coordinator and all entities.
+UPDATE_INTERVAL = timedelta(seconds=30)
+
+# After any PUT, keep optimistic cache values until the cloud reflects the write
+# or this window expires. Rapid-poll testing: usually ~2s, sometimes ~6s.
+HOLD_PENDING_SECONDS = 7
+
+# Diagnostic rapid polling after a successful PUT (when toggle is on).
+RAPID_POLL_AFTER_PUT_INTERVAL = 1
+RAPID_POLL_AFTER_PUT_COUNT = 15
+
 DOMAIN = "daikinskyport"
 MANUFACTURER = "Daikin"
+
+# Sensors grouped on the per-thermostat outdoor weather device.
+OUTDOOR_WEATHER_SENSOR_KEYS = frozenset({
+    "outdoor_weather_temperature",
+    "outdoor_weather_humidity",
+    "outdoor_pm1",
+    "outdoor_aqi",
+    "outdoor_ozone",
+})
 
 # Full list of HA conditions as of 10/2023
 from homeassistant.components.weather import (

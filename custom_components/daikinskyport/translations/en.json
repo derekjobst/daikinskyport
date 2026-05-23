@@ -22,5 +22,25 @@
         "abort": {
             "single_instance_allowed": "Only a single configuration of Daikin Skyport is allowed."
         }
+    },
+    "entity": {
+        "switch": {
+            "rapid_poll_after_writes": {
+                "name": "Rapid poll after writes"
+            }
+        },
+        "climate": {
+            "away_settings": {
+                "name": "Away Settings"
+            }
+        },
+        "sensor": {
+            "schedule_override_until": {
+                "name": "Schedule override until"
+            },
+            "next_scheduled_temperature": {
+                "name": "Next scheduled temperature"
+            }
+        }
     }
 }

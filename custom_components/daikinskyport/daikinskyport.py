@@ -10,11 +10,142 @@ from requests.exceptions import RequestException
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
-from .const import DAIKIN_PERCENT_MULTIPLIER
+from .const import DAIKIN_PERCENT_MULTIPLIER, HOLD_PENDING_SECONDS, _LOGGER
+from .logbook_helpers import (
+    format_dict_temps_for_log,
+    format_temp_dual,
+    format_temps_dict_for_log,
+)
 
-logger = logging.getLogger('daikinskyport')
+# Temperature-related keys logged on API requests/responses (debug).
+_TEMP_LOG_KEYS = frozenset({
+    "hspHome",
+    "cspHome",
+    "hspActive",
+    "cspActive",
+    "hspAway",
+    "cspAway",
+    "tempIndoor",
+    "tempOutdoor",
+})
+
+# Key fields for INFO-level manual refresh snapshots (not full schedule dump).
+_CLOUD_SNAPSHOT_KEYS = (
+    "hspHome",
+    "cspHome",
+    "hspActive",
+    "cspActive",
+    "tempIndoor",
+    "tempOutdoor",
+    "schedOverride",
+    "schedOverrideDuration",
+    "schedResumeTime",
+    "schedEnabled",
+    "mode",
+)
+
+
+def _extract_temp_fields(data):
+    """Return temperature/setpoint fields from an API body or device payload."""
+    if not isinstance(data, dict):
+        return {}
+    temps = {}
+    for key, value in data.items():
+        if key in _TEMP_LOG_KEYS:
+            temps[key] = value
+        elif key.endswith("hsp") or key.endswith("csp"):
+            temps[key] = value
+    return temps
+
+
+def _safe_body_for_log(body):
+    """Redact secrets before logging request bodies."""
+    if not isinstance(body, dict):
+        return body
+    safe = dict(body)
+    if "password" in safe:
+        safe["password"] = "***"
+    if "refreshToken" in safe:
+        safe["refreshToken"] = "***"
+    return safe
+
+
+def _log_api_request(method, url, action, *, device_id=None, body=None):
+    """Log an outbound API call at debug level."""
+    temps = _extract_temp_fields(body)
+    if body is not None:
+        _LOGGER.debug(
+            "API request %s %s action=%s device=%s temps_submitted=%s body=%s",
+            method,
+            url,
+            action,
+            device_id,
+            format_temps_dict_for_log(temps) if temps else None,
+            format_dict_temps_for_log(_safe_body_for_log(body)),
+        )
+    else:
+        _LOGGER.debug(
+            "API request %s %s action=%s device=%s",
+            method,
+            url,
+            action,
+            device_id,
+        )
+
+
+def _log_api_response(method, url, action, status_code, *, device_id=None, data=None):
+    """Log an API response at debug level, including temps when present."""
+    temps = _extract_temp_fields(data)
+    if temps:
+        _LOGGER.debug(
+            "API response %s %s action=%s device=%s status=%s temps_in_response=%s",
+            method,
+            url,
+            action,
+            device_id,
+            status_code,
+            format_temps_dict_for_log(temps),
+        )
+    else:
+        _LOGGER.debug(
+            "API response %s %s action=%s device=%s status=%s",
+            method,
+            url,
+            action,
+            device_id,
+            status_code,
+        )
+
+
+def _parse_response_json(response):
+    """Parse JSON from a response when a body is present."""
+    if not response.text:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        _LOGGER.debug("API response body is not JSON (len=%s)", len(response.text))
+        return None
 
 NEXT_SCHEDULE = 1
+# Ignore tiny float differences when comparing active vs home setpoints.
+ACTIVE_HOME_MISMATCH_THRESHOLD = 0.15
+_PENDING_UNTIL_KEY = "_hold_pending_until"
+_PENDING_KEYS_KEY = "_pending_write_keys"
+
+
+def _pending_values_match(expected, actual) -> bool:
+    """Return True when a polled cloud value matches an optimistic write."""
+    if expected is None and actual is None:
+        return True
+    if expected is None or actual is None:
+        return False
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return expected is actual
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return abs(float(expected) - float(actual)) <= ACTIVE_HOME_MISMATCH_THRESHOLD
+    return expected == actual
+
 
 class ExpiredTokenError(Exception):
     """Raised when Daikin Skyport API returns a code indicating expired credentials."""
@@ -29,7 +160,7 @@ def config_from_file(filename, config=None):
             with open(filename, 'w') as fdesc:
                 fdesc.write(json.dumps(config))
         except IOError as error:
-            logger.exception(error)
+            _LOGGER.exception(error)
             return False
         return True
     else:
@@ -52,12 +183,16 @@ class DaikinSkyport(object):
         self.thermostatlist = list()
         self.authenticated = False
         self.skip_next = False
+        # Optional callback(index) after a successful PUT (set by coordinator).
+        self.on_put_success = None
+        # Last mismatch signature per thermostat index (throttle repeat warns).
+        self._active_home_mismatch_warned = {}
 
         if config is None:
             self.file_based_config = True
             if config_filename is None:
                 if (user_email is None) or (user_password is None):
-                    logger.error("Error. No user email or password was supplied.")
+                    _LOGGER.error("Error. No user email or password was supplied.")
                     return
                 jsonconfig = {"EMAIL": user_email, "PASSWORD": user_password}
                 config_filename = 'daikinskyport.conf'
@@ -68,7 +203,7 @@ class DaikinSkyport(object):
         if 'EMAIL' in config:
             self.user_email = config['EMAIL']
         else:
-            logger.error("Email missing from config.")
+            _LOGGER.error("Email missing from config.")
         if 'PASSWORD' in config: # PASSWORD is only needed during first login
             self.user_password = config['PASSWORD']
 
@@ -92,24 +227,26 @@ class DaikinSkyport(object):
         header = {'Accept': 'application/json',
                   'Content-Type': 'application/json'}
         data = {"email": self.user_email, "password": self.user_password}
+        _log_api_request("POST", url, "login", body=data)
         try:
             request = requests.post(url, headers=header, json=data)
         except RequestException as e:
-            logger.error("Error connecting to Daikin Skyport.  Possible connectivity outage."
+            _LOGGER.error("Error connecting to Daikin Skyport.  Possible connectivity outage."
                         "Could not request token. %s", e)
             return False
+        _log_api_response("POST", url, "login", request.status_code)
         if request.status_code == requests.codes.ok:
             json_data = request.json()
             self.access_token = json_data['accessToken']
             self.refresh_token = json_data['refreshToken']
             if self.refresh_token is None:
-                logger.error("Auth did not return a refresh token.")
+                _LOGGER.error("Auth did not return a refresh token.")
             else:
                 if self.file_based_config:
                     self.write_tokens_to_file()
                 return json_data
         else:
-            logger.error('Error while requesting tokens from daikinskyport.com.'
+            _LOGGER.error('Error while requesting tokens from daikinskyport.com.'
                         ' Status code: %s Message: %s', request.status_code, request.text)
             return False
 
@@ -120,7 +257,9 @@ class DaikinSkyport(object):
                   'Content-Type': 'application/json'}
         data = {'email': self.user_email,
                   'refreshToken': self.refresh_token}
+        _log_api_request("POST", url, "refresh token", body=data)
         request = requests.post(url, headers=header, json=data)
+        _log_api_response("POST", url, "refresh token", request.status_code)
         if request.status_code == requests.codes.ok:
             json_data = request.json()
             self.access_token = json_data['accessToken']
@@ -128,13 +267,99 @@ class DaikinSkyport(object):
                 self.write_tokens_to_file()
             return True
         else:
-            logger.warn("Could not refresh tokens, Trying to re-request. Status code: %s Message: %s ", request.status_code, request.text)
+            _LOGGER.warn("Could not refresh tokens, Trying to re-request. Status code: %s Message: %s ", request.status_code, request.text)
             result = self.request_tokens()
             if result is not None:
                 return True
             return False
 
-    def get_thermostats(self):
+    def _active_home_mismatch_details(self, thermostat_info):
+        """Return mismatch lines when active setpoints differ from home."""
+        if not isinstance(thermostat_info, dict):
+            return ()
+        details = []
+        for home_key, active_key, label in (
+            ("hspHome", "hspActive", "heat"),
+            ("cspHome", "cspActive", "cool"),
+        ):
+            home = thermostat_info.get(home_key)
+            active = thermostat_info.get(active_key)
+            if home is None or active is None:
+                continue
+            if abs(float(home) - float(active)) > ACTIVE_HOME_MISMATCH_THRESHOLD:
+                details.append(
+                    f"{label} home={format_temp_dual(home)} active={format_temp_dual(active)}"
+                )
+        return tuple(details)
+
+    def _should_warn_active_home_mismatch(
+        self, thermostat_info, old_thermostat, *, context
+    ):
+        """Warn only during holds or raw-cloud refresh (schedule can legitimately differ)."""
+        if "raw" in context.lower():
+            return True
+        if thermostat_info.get("schedOverride") == 1:
+            return True
+        if not thermostat_info.get("schedEnabled", True):
+            return True
+        hold_pending = old_thermostat.get("_hold_pending_until")
+        return bool(hold_pending and hold_pending > time.time())
+
+    def _warn_active_home_mismatch_if_needed(
+        self,
+        thermostat_info,
+        index,
+        *,
+        name=None,
+        device_id=None,
+        context="poll",
+        old_thermostat=None,
+    ):
+        """Log when cloud active/home setpoints diverge (usually API catch-up lag)."""
+        details = self._active_home_mismatch_details(thermostat_info)
+        if not details:
+            self._active_home_mismatch_warned.pop(index, None)
+            return
+        old_thermostat = old_thermostat or {}
+        if not self._should_warn_active_home_mismatch(
+            thermostat_info, old_thermostat, context=context
+        ):
+            return
+        signature = tuple(details)
+        if self._active_home_mismatch_warned.get(index) == signature:
+            return
+        self._active_home_mismatch_warned[index] = signature
+        hold_pending = old_thermostat.get("_hold_pending_until")
+        extra = ""
+        if hold_pending and hold_pending > time.time():
+            extra = f"; hold_pending={round(hold_pending - time.time(), 1)}s"
+        _LOGGER.warning(
+            "Cloud active/home mismatch [%s] %s (%s): %s%s",
+            context,
+            name or thermostat_info.get("name", index),
+            device_id or thermostat_info.get("id"),
+            "; ".join(details),
+            extra,
+        )
+
+    def log_cloud_snapshot(self, index, context="manual refresh"):
+        """Log primary setpoints from cache at INFO (for manual refresh testing)."""
+        if not (0 <= index < len(self.thermostats)):
+            return
+        thermostat = self.thermostats[index]
+        snapshot = {key: thermostat.get(key) for key in _CLOUD_SNAPSHOT_KEYS}
+        hold_pending = thermostat.get("_hold_pending_until")
+        if hold_pending and hold_pending > time.time():
+            snapshot["_hold_pending_seconds_left"] = round(hold_pending - time.time(), 1)
+        _LOGGER.info(
+            "Cloud snapshot [%s] %s (%s): %s",
+            context,
+            thermostat.get("name", index),
+            thermostat.get("id"),
+            format_dict_temps_for_log(snapshot),
+        )
+
+    def get_thermostats(self, apply_hold_merge=True):
         ''' Set self.thermostats to a json list of thermostats from daikinskyport.com '''
         url = 'https://api.daikinskyport.com/devices'
         header = {'Content-Type': 'application/json;charset=UTF-8',
@@ -145,11 +370,13 @@ class DaikinSkyport(object):
         http.mount("https://", adapter)
         http.mount("http://", adapter)
 
+        _log_api_request("GET", url, "list devices")
         try:
             request = http.get(url, headers=header)
         except RequestException as e:
-            logger.warn("Error connecting to Daikin Skyport.  Possible connectivity outage: %s", e)
+            _LOGGER.warn("Error connecting to Daikin Skyport.  Possible connectivity outage: %s", e)
             return None
+        _log_api_response("GET", url, "list devices", request.status_code)
         if request.status_code == requests.codes.ok:
             self.authenticated = True
             self.thermostatlist = request.json()
@@ -167,10 +394,29 @@ class DaikinSkyport(object):
                 for index in range(len(self.thermostats)):
                     if thermostat['id'] == self.thermostats[index]['id']:
                         overwrite = True
-                        
-                        if 'delayed_reset_timestamp' in self.thermostats[index]:
-                            thermostat_info['delayed_reset_timestamp'] = self.thermostats[index]['delayed_reset_timestamp']
-                        
+                        old_thermostat = self.thermostats[index]
+
+                        if 'delayed_reset_timestamp' in old_thermostat:
+                            thermostat_info['delayed_reset_timestamp'] = old_thermostat['delayed_reset_timestamp']
+
+                        poll_context = (
+                            "poll (raw cloud)"
+                            if not apply_hold_merge
+                            else "poll"
+                        )
+                        self._warn_active_home_mismatch_if_needed(
+                            thermostat_info,
+                            index,
+                            name=thermostat.get("name"),
+                            device_id=thermostat["id"],
+                            context=poll_context,
+                            old_thermostat=old_thermostat,
+                        )
+
+                        if apply_hold_merge:
+                            thermostat_info = self._merge_pending_writes(
+                                old_thermostat, thermostat_info
+                            )
                         self.thermostats[index] = thermostat_info
                 if not overwrite:
                     thermostat_info['delayed_reset_timestamp'] = None
@@ -179,7 +425,7 @@ class DaikinSkyport(object):
             return self.thermostats
         else:
             self.authenticated = False
-            logger.debug("Error connecting to Daikin Skyport while attempting to get "
+            _LOGGER.debug("Error connecting to Daikin Skyport while attempting to get "
                         "thermostat data. Status code: %s Message: %s", request.status_code, request.text)
             raise ExpiredTokenError ("Daikin Skyport token expired")
             return None
@@ -195,26 +441,32 @@ class DaikinSkyport(object):
         http.mount("https://", adapter)
         http.mount("http://", adapter)
 
+        _log_api_request("GET", url, "get device data", device_id=deviceid)
         try:
             request = http.get(url, headers=header)
             request.raise_for_status()
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 400 and e.response.json().get("message") == "DeviceOfflineException":
-                logger.warn("Device is offline: %s", deviceid)
+                _LOGGER.warn("Device is offline: %s", deviceid)
                 self.authenticated = True
                 return None
             else:
                 self.authenticated = False
-            logger.debug("Error connecting to Daikin Skyport while attempting to get "
-                        "thermostat data. Status code: %s Message: %s", request.status_code, request.text)
+            _LOGGER.debug("Error connecting to Daikin Skyport while attempting to get "
+                        "thermostat data. Status code: %s Message: %s", e.response.status_code, e.response.text)
             raise ExpiredTokenError ("Daikin Skyport token expired")
             return None
         if request.status_code == requests.codes.ok:
             self.authenticated = True
-            return request.json()
+            data = request.json()
+            _log_api_response(
+                "GET", url, "get device data", request.status_code,
+                device_id=deviceid, data=data,
+            )
+            return data
         else:
             self.authenticated = False
-            logger.debug("Error connecting to Daikin Skyport while attempting to get "
+            _LOGGER.debug("Error connecting to Daikin Skyport while attempting to get "
                         "thermostat data. Status code: %s Message: %s", request.status_code, request.text)
             raise ExpiredTokenError ("Daikin Skyport token expired")
             return None
@@ -223,82 +475,291 @@ class DaikinSkyport(object):
         ''' Return a single thermostat based on index '''
         return self.thermostats[index]
 
+    def refresh_thermostat_from_cloud(
+        self, index, *, apply_hold_merge=True, context="poll"
+    ):
+        """GET one thermostat from the cloud and update the local cache."""
+        if not (0 <= index < len(self.thermostats)):
+            return False
+        old_thermostat = self.thermostats[index]
+        device_id = old_thermostat["id"]
+        thermostat_info = self.get_thermostat_info(device_id)
+        if thermostat_info is None:
+            return False
+
+        thermostat_info["name"] = old_thermostat.get("name")
+        thermostat_info["id"] = device_id
+        thermostat_info["model"] = old_thermostat.get("model")
+        if "delayed_reset_timestamp" in old_thermostat:
+            thermostat_info["delayed_reset_timestamp"] = old_thermostat[
+                "delayed_reset_timestamp"
+            ]
+
+        poll_context = (
+            f"{context} (raw cloud)" if not apply_hold_merge else context
+        )
+        self._warn_active_home_mismatch_if_needed(
+            thermostat_info,
+            index,
+            name=old_thermostat.get("name"),
+            device_id=device_id,
+            context=poll_context,
+            old_thermostat=old_thermostat,
+        )
+
+        if apply_hold_merge:
+            thermostat_info = self._merge_pending_writes(
+                old_thermostat, thermostat_info
+            )
+        self.thermostats[index] = thermostat_info
+        self.log_cloud_snapshot(index, context)
+        return True
+
     def get_sensors(self, index):
-        ''' Return sensors based on index '''
-        sensors = list()
+        """Return sensor readings for a thermostat index."""
+        sensors = []
+        if not (0 <= index < len(self.thermostats)):
+            return sensors
+
         thermostat = self.thermostats[index]
-        name = thermostat['name']
-        sensors.append({"name": f"{name} Outdoor", "value": thermostat['tempOutdoor'], "type": "temperature"})
-        sensors.append({"name": f"{name} Outdoor", "value": thermostat['humOutdoor'], "type": "humidity"})
+        name = thermostat.get("name", str(index))
+
+        def add(key, label, value, sensor_type):
+            sensors.append(
+                {
+                    "key": key,
+                    "name": f"{name} {label}",
+                    "value": value,
+                    "type": sensor_type,
+                }
+            )
+
+        if "tempOutdoor" in thermostat:
+            add("outdoor_weather_temperature", "Outdoor", thermostat["tempOutdoor"], "temperature")
+        if "humOutdoor" in thermostat:
+            add("outdoor_weather_humidity", "Outdoor", thermostat["humOutdoor"], "humidity")
         if "ctOutdoorFanRequestedDemandPercentage" in thermostat:
-            sensors.append({"name": f"{name} Outdoor fan", "value": round(thermostat['ctOutdoorFanRequestedDemandPercentage'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "demand"})
+            add(
+                "outdoor_fan_demand",
+                "Outdoor fan",
+                round(
+                    thermostat["ctOutdoorFanRequestedDemandPercentage"]
+                    / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "demand",
+            )
         if "ctOutdoorHeatRequestedDemand" in thermostat:
-            sensors.append({"name": f"{name} Outdoor heat pump", "value": round(thermostat['ctOutdoorHeatRequestedDemand'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "demand"})
+            add(
+                "outdoor_heat_demand",
+                "Outdoor heat pump",
+                round(
+                    thermostat["ctOutdoorHeatRequestedDemand"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "demand",
+            )
         if "ctOutdoorCoolRequestedDemand" in thermostat:
-            sensors.append({"name": f"{name} Outdoor cooling", "value": round(thermostat['ctOutdoorCoolRequestedDemand'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "demand"})
+            add(
+                "outdoor_cool_demand",
+                "Outdoor cooling",
+                round(
+                    thermostat["ctOutdoorCoolRequestedDemand"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "demand",
+            )
         if "ctOutdoorPower" in thermostat:
-            sensors.append({"name": f"{name} Outdoor", "value": thermostat['ctOutdoorPower'] * 10, "type": "power"})
+            add(
+                "outdoor_power",
+                "Outdoor",
+                thermostat["ctOutdoorPower"] * 10,
+                "power",
+            )
         if "ctOutdoorFrequencyInPercent" in thermostat:
-            sensors.append({"name": f"{name} Outdoor", "value": round(thermostat['ctOutdoorFrequencyInPercent'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "frequency_percent"})
+            add(
+                "outdoor_frequency",
+                "Outdoor",
+                round(
+                    thermostat["ctOutdoorFrequencyInPercent"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "frequency_percent",
+            )
         if "tempIndoor" in thermostat:
-            sensors.append({"name": f"{name} Indoor", "value": thermostat['tempIndoor'], "type": "temperature"})
+            add("indoor_temperature", "Indoor", thermostat["tempIndoor"], "temperature")
         if "humIndoor" in thermostat:
-            sensors.append({"name": f"{name} Indoor", "value": thermostat['humIndoor'], "type": "humidity"})
+            add("indoor_humidity", "Indoor", thermostat["humIndoor"], "humidity")
         if "ctIFCFanRequestedDemandPercent" in thermostat:
-            sensors.append({"name": f"{name} Indoor fan", "value": round(thermostat['ctIFCFanRequestedDemandPercent'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "demand"})
+            add(
+                "indoor_fan_demand",
+                "Indoor fan",
+                round(
+                    thermostat["ctIFCFanRequestedDemandPercent"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "demand",
+            )
         if "ctIFCCurrentFanActualStatus" in thermostat:
-            sensors.append({"name": f"{name} Indoor fan", "value": round(thermostat['ctIFCCurrentFanActualStatus'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "actual_status"})
+            add(
+                "indoor_fan_actual",
+                "Indoor fan",
+                round(
+                    thermostat["ctIFCCurrentFanActualStatus"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "actual_status",
+            )
         if "ctIFCCoolRequestedDemandPercent" in thermostat:
-            sensors.append({"name": f"{name} Indoor cooling", "value": round(thermostat['ctIFCCoolRequestedDemandPercent'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "demand"})
+            add(
+                "indoor_cool_demand",
+                "Indoor cooling",
+                round(
+                    thermostat["ctIFCCoolRequestedDemandPercent"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "demand",
+            )
         if "ctIFCCurrentCoolActualStatus" in thermostat:
-            sensors.append({"name": f"{name} Indoor cooling", "value": round(thermostat['ctIFCCurrentCoolActualStatus'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "actual_status"})
+            add(
+                "indoor_cool_actual",
+                "Indoor cooling",
+                round(
+                    thermostat["ctIFCCurrentCoolActualStatus"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "actual_status",
+            )
         if "ctIFCHeatRequestedDemandPercent" in thermostat:
-            sensors.append({"name": f"{name} Indoor furnace", "value": round(thermostat['ctIFCHeatRequestedDemandPercent'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "demand"})
+            add(
+                "indoor_heat_demand",
+                "Indoor furnace",
+                round(
+                    thermostat["ctIFCHeatRequestedDemandPercent"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "demand",
+            )
         if "ctIFCCurrentHeatActualStatus" in thermostat:
-            sensors.append({"name": f"{name} Indoor furnace", "value": round(thermostat['ctIFCCurrentHeatActualStatus'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "actual_status"})
+            add(
+                "indoor_heat_actual",
+                "Indoor furnace",
+                round(
+                    thermostat["ctIFCCurrentHeatActualStatus"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "actual_status",
+            )
         if "ctIFCHumRequestedDemandPercent" in thermostat:
-            sensors.append({"name": f"{name} Indoor humidifier", "value": round(thermostat['ctIFCHumRequestedDemandPercent'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "demand"})
+            add(
+                "indoor_humidifier_demand",
+                "Indoor humidifier",
+                round(
+                    thermostat["ctIFCHumRequestedDemandPercent"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "demand",
+            )
         if "ctIFCDehumRequestedDemandPercent" in thermostat:
-            sensors.append({"name": f"{name} Indoor dehumidifier", "value": round(thermostat['ctIFCDehumRequestedDemandPercent'] / DAIKIN_PERCENT_MULTIPLIER, 1), "type": "demand"})
+            add(
+                "indoor_dehumidifier_demand",
+                "Indoor dehumidifier",
+                round(
+                    thermostat["ctIFCDehumRequestedDemandPercent"] / DAIKIN_PERCENT_MULTIPLIER,
+                    1,
+                ),
+                "demand",
+            )
         if "ctOutdoorAirTemperature" in thermostat:
-            sensors.append({"name": f"{name} Outdoor air", "value": round(((thermostat['ctOutdoorAirTemperature'] / 10) - 32) * 5 / 9, 1), "type": "temperature"})
+            add(
+                "outdoor_unit_temperature",
+                "Outdoor air",
+                round(
+                    ((thermostat["ctOutdoorAirTemperature"] / 10) - 32) * 5 / 9,
+                    1,
+                ),
+                "temperature",
+            )
         if "ctIFCIndoorBlowerAirflow" in thermostat:
-            sensors.append({"name": f"{name} Indoor furnace blower", "value": thermostat['ctIFCIndoorBlowerAirflow'], "type": "airflow"})
+            add(
+                "indoor_furnace_blower_airflow",
+                "Indoor furnace blower",
+                thermostat["ctIFCIndoorBlowerAirflow"],
+                "airflow",
+            )
         if "ctAHCurrentIndoorAirflow" in thermostat:
-            sensors.append({"name": f"{name} Indoor air handler blower", "value": thermostat['ctAHCurrentIndoorAirflow'], "type": "airflow"})
+            add(
+                "indoor_air_handler_blower_airflow",
+                "Indoor air handler blower",
+                thermostat["ctAHCurrentIndoorAirflow"],
+                "airflow",
+            )
 
-        ''' if equipment is idle, set power to zero rather than accept bogus data '''
-        if thermostat['equipmentStatus'] == 5:
-            sensors.append({"name": f"{name} Indoor", "value": 0, "type": "power"})
+        # If equipment is idle, report zero indoor power instead of bogus data.
+        if thermostat.get("equipmentStatus") == 5:
+            add("indoor_power", "Indoor", 0, "power")
         elif "ctIndoorPower" in thermostat:
-            sensors.append({"name": f"{name} Indoor", "value": thermostat['ctIndoorPower'], "type": "power"})
+            add("indoor_power", "Indoor", thermostat["ctIndoorPower"], "power")
 
-
-        if self.thermostats[index]['aqOutdoorAvailable']:
-            sensors.append({"name": f"{name} Outdoor", "value": thermostat['aqOutdoorParticles'], "type": "particle"})
-            sensors.append({"name": f"{name} Outdoor", "value": thermostat['aqOutdoorValue'], "type": "score"})
-            sensors.append({"name": f"{name} Outdoor", "value": round(thermostat['aqOutdoorOzone'] * 1.96), "type": "ozone"})
-        if self.thermostats[index]['aqIndoorAvailable']:
-            sensors.append({"name": f"{name} Indoor", "value": thermostat['aqIndoorParticlesValue'], "type": "particle"})
-            sensors.append({"name": f"{name} Indoor", "value": thermostat['aqIndoorValue'], "type": "score"})
-            sensors.append({"name": f"{name} Indoor", "value": thermostat['aqIndoorVOCValue'], "type": "VOC"})
+        if thermostat.get("aqOutdoorAvailable"):
+            if "aqOutdoorParticles" in thermostat:
+                add(
+                    "outdoor_pm1",
+                    "Outdoor",
+                    thermostat["aqOutdoorParticles"],
+                    "particle",
+                )
+            if "aqOutdoorValue" in thermostat:
+                add("outdoor_aqi", "Outdoor", thermostat["aqOutdoorValue"], "score")
+            if "aqOutdoorOzone" in thermostat:
+                add(
+                    "outdoor_ozone",
+                    "Outdoor",
+                    round(thermostat["aqOutdoorOzone"] * 1.96),
+                    "ozone",
+                )
+        if thermostat.get("aqIndoorAvailable"):
+            if "aqIndoorParticlesValue" in thermostat:
+                add(
+                    "indoor_pm1",
+                    "Indoor",
+                    thermostat["aqIndoorParticlesValue"],
+                    "particle",
+                )
+            if "aqIndoorValue" in thermostat:
+                add("indoor_aqi", "Indoor", thermostat["aqIndoorValue"], "score")
+            if "aqIndoorVOCValue" in thermostat:
+                add("indoor_voc", "Indoor", thermostat["aqIndoorVOCValue"], "VOC")
 
         fault_sensors = [
-            ("ctAHCriticalFault", "Air Handler Critical Fault"),
-            ("ctAHMinorFault", "Air Handler Minor Fault"),
-            ("ctEEVCoilCriticalFault", "EEV Coil Critical Fault"),
-            ("ctEEVCoilMinorFault", "EEV Coil Minor Fault"),
-            ("ctIFCCriticalFault", "Indoor Furnace Critical Fault"),
-            ("ctIFCMinorFault", "Indoor Furnace Minor Fault"),
-            ("ctOutdoorCriticalFault", "Outdoor Critical Fault"),
-            ("ctOutdoorMinorFault", "Outdoor Minor Fault"),
-            ("ctStatCriticalFault", "Thermostat Critical Fault"),
-            ("ctStatMinorFault", "Thermostat Minor Fault"),
+            ("ctAHCriticalFault", "air_handler_critical_fault", "Air Handler Critical Fault"),
+            ("ctAHMinorFault", "air_handler_minor_fault", "Air Handler Minor Fault"),
+            ("ctEEVCoilCriticalFault", "eev_coil_critical_fault", "EEV Coil Critical Fault"),
+            ("ctEEVCoilMinorFault", "eev_coil_minor_fault", "EEV Coil Minor Fault"),
+            ("ctIFCCriticalFault", "indoor_furnace_critical_fault", "Indoor Furnace Critical Fault"),
+            ("ctIFCMinorFault", "indoor_furnace_minor_fault", "Indoor Furnace Minor Fault"),
+            ("ctOutdoorCriticalFault", "outdoor_critical_fault", "Outdoor Critical Fault"),
+            ("ctOutdoorMinorFault", "outdoor_minor_fault", "Outdoor Minor Fault"),
+            ("ctStatCriticalFault", "thermostat_critical_fault", "Thermostat Critical Fault"),
+            ("ctStatMinorFault", "thermostat_minor_fault", "Thermostat Minor Fault"),
         ]
 
-        for fault_key, fault_name in fault_sensors:
-            if fault_key in thermostat:
-                sensors.append({"name": f"{name} {fault_name}", "value": thermostat[fault_key], "type": "fault_code"})
+        for fault_field, fault_key, fault_label in fault_sensors:
+            if fault_field not in thermostat:
+                continue
+            fault_value = thermostat[fault_field]
+            # 255 means this equipment does not expose this fault channel.
+            try:
+                if int(fault_value) == 255:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            add(
+                fault_key,
+                fault_label,
+                fault_value,
+                "fault_code",
+            )
 
         return sensors
 
@@ -313,25 +774,86 @@ class DaikinSkyport(object):
         else:
             self.config = config
 
-    def update(self):
+    def update(self, force=False, apply_hold_merge=True):
         ''' Get new thermostat data from daikin skyport '''
-        if self.skip_next:
-            logger.debug("Skipping update due to setting change")
+        if not force and self.skip_next:
+            _LOGGER.debug("Skipping update due to setting change")
             self.skip_next = False
             return
-        
-        result = self.get_thermostats()
+
+        result = self.get_thermostats(apply_hold_merge=apply_hold_merge)
         self.check_and_perform_delayed_resets()
 
         return result
 
+    def _write_confirmed(self, pending: dict, new: dict) -> bool:
+        """Return True when the cloud poll reflects all pending optimistic fields."""
+        return all(
+            _pending_values_match(expected, new.get(key))
+            for key, expected in pending.items()
+        )
+
+    def _merge_pending_writes(self, old, new):
+        """Keep optimistic PUT fields until the cloud API catches up."""
+        until = old.get(_PENDING_UNTIL_KEY)
+        pending = old.get(_PENDING_KEYS_KEY) or {}
+        if not until or time.time() > until or not pending:
+            return new
+        if self._write_confirmed(pending, new):
+            return new
+        merged = dict(new)
+        for key, expected in pending.items():
+            if not _pending_values_match(expected, new.get(key)):
+                merged[key] = expected
+        merged[_PENDING_UNTIL_KEY] = until
+        merged[_PENDING_KEYS_KEY] = pending
+        if "_override_started_at" in old:
+            merged["_override_started_at"] = old["_override_started_at"]
+        return merged
+
+    def _mark_write_pending(self, index, body: dict) -> None:
+        """Track fields from a PUT so polls do not revert the UI with stale data."""
+        if not (0 <= index < len(self.thermostats)):
+            return
+        thermostat = self.thermostats[index]
+        pending = dict(thermostat.get(_PENDING_KEYS_KEY) or {})
+        for key, value in body.items():
+            if not key.startswith("_"):
+                pending[key] = value
+        thermostat[_PENDING_KEYS_KEY] = pending
+        thermostat[_PENDING_UNTIL_KEY] = time.time() + HOLD_PENDING_SECONDS
+
+    def _mark_override_started(self, index) -> None:
+        """Record when a timed schedule override began (for end-time display)."""
+        if 0 <= index < len(self.thermostats):
+            self.thermostats[index]["_override_started_at"] = time.time()
+
+    def _clear_override_started(self, index) -> None:
+        """Clear local override timing when schedule override ends."""
+        if 0 <= index < len(self.thermostats):
+            self.thermostats[index].pop("_override_started_at", None)
+
+    def _apply_local_changes(self, index, body):
+        """Apply successful PUT fields to the local cache for immediate HA updates."""
+        if not (0 <= index < len(self.thermostats)):
+            return
+        thermostat = self.thermostats[index]
+        thermostat.update(body)
+        pending_body = dict(body)
+        if "hspHome" in body:
+            thermostat["hspActive"] = body["hspHome"]
+            pending_body["hspActive"] = body["hspHome"]
+        if "cspHome" in body:
+            thermostat["cspActive"] = body["cspHome"]
+            pending_body["cspActive"] = body["cspHome"]
+        self._mark_write_pending(index, pending_body)
+
     def make_request(self, index, body, log_msg_action, *, retry_count=0):
-        self.skip_next = True
         deviceID = self.thermostats[index]['id']
         url = 'https://api.daikinskyport.com/deviceData/' + deviceID
         header = {'Content-Type': 'application/json;charset=UTF-8',
                   'Authorization': 'Bearer ' + self.access_token}
-        logger.debug("Make Request: %s, Device: %s, Body: %s", log_msg_action, deviceID, body)
+        _log_api_request("PUT", url, log_msg_action, device_id=deviceID, body=body)
         retry_strategy = Retry(total=8, backoff_factor=0.1,)
         adapter = HTTPAdapter(max_retries=retry_strategy)
         http = requests.Session()
@@ -341,9 +863,20 @@ class DaikinSkyport(object):
         try:
             request = http.put(url, headers=header, json=body)
         except RequestException as e:
-            logger.warn("Error connecting to Daikin Skyport.  Possible connectivity outage: %s", e)
+            _LOGGER.warn("Error connecting to Daikin Skyport.  Possible connectivity outage: %s", e)
             return None
+        response_data = _parse_response_json(request)
+        _log_api_response(
+            "PUT", url, log_msg_action, request.status_code,
+            device_id=deviceID, data=response_data,
+        )
         if request.status_code == requests.codes.ok:
+            self._apply_local_changes(index, body)
+            # Avoid an immediate full fetch that can return stale data and
+            # overwrite the optimistic cache; the next scheduled poll will sync.
+            self.skip_next = True
+            if self.on_put_success:
+                self.on_put_success(index)
             return request
         elif (request.status_code == 401 and retry_count == 0 and
               request.json()['error'] == 'authorization_expired'):
@@ -351,7 +884,7 @@ class DaikinSkyport(object):
                 return self.make_request(index, body, log_msg_action,
                                          retry_count=retry_count + 1)
         else:
-            logger.warn(
+            _LOGGER.warn(
                 "Error fetching data from Daikin Skyport while attempting to %s: %s",
                 log_msg_action, request.json())
             return None
@@ -362,6 +895,19 @@ class DaikinSkyport(object):
         log_msg_action = "set HVAC mode"
         self.thermostats[index]["mode"] = hvac_mode
         return self.make_request(index, body, log_msg_action)
+
+    def set_schedule_part_setpoints(
+        self, index, prefix, heat_temp=None, cool_temp=None
+    ):
+        """Update only hsp/csp for one schedule period (no time/enable/label PUT)."""
+        body = {}
+        if heat_temp is not None:
+            body[f"{prefix}hsp"] = round(heat_temp, 1)
+        if cool_temp is not None:
+            body[f"{prefix}csp"] = round(cool_temp, 1)
+        if not body:
+            return None
+        return self.make_request(index, body, "set schedule period setpoints")
 
     def set_thermostat_schedule(self, index, prefix, start, enable, label, heating, cooling):
         ''' Schedule to set the thermostat.
@@ -407,7 +953,7 @@ class DaikinSkyport(object):
             # Mark this thermostat for delayed reset
             # The coordinator will handle the actual reset after 15 seconds
             self.thermostats[index]["delayed_reset_timestamp"] = time.time()
-            logger.debug("Fan mode set successfully, marked for delayed reset")
+            _LOGGER.debug("Fan mode set successfully, marked for delayed reset")
         
         return result
 
@@ -419,7 +965,7 @@ class DaikinSkyport(object):
             if thermostat.get("delayed_reset_timestamp"):
                 # Check if 15 seconds have passed
                 if current_time - thermostat["delayed_reset_timestamp"] >= 15:
-                    logger.debug(f"Performing delayed reset for thermostat {index}")
+                    _LOGGER.debug("Performing delayed reset for thermostat %s", index)
                     
                     # Perform the delayed reset
                     reset_body = {
@@ -473,8 +1019,11 @@ class DaikinSkyport(object):
         log_msg_action = "set hold temp"
         self.thermostats[index]["hspHome"] = round(heat_temp, 1)
         self.thermostats[index]["cspHome"] = round(cool_temp, 1)
+        self.thermostats[index]["hspActive"] = round(heat_temp, 1)
+        self.thermostats[index]["cspActive"] = round(cool_temp, 1)
         self.thermostats[index]["schedOverride"] = 1
         self.thermostats[index]["schedOverrideDuration"] = hold_duration
+        self._mark_override_started(index)
         return self.make_request(index, body, log_msg_action)
 
     def set_permanent_hold(self, index, cool_temp=None, heat_temp=None):
@@ -493,9 +1042,23 @@ class DaikinSkyport(object):
         log_msg_action = "set permanent hold"
         self.thermostats[index]["hspHome"] = round(heat_temp, 1)
         self.thermostats[index]["cspHome"] = round(cool_temp, 1)
+        self.thermostats[index]["hspActive"] = round(heat_temp, 1)
+        self.thermostats[index]["cspActive"] = round(cool_temp, 1)
         self.thermostats[index]["schedOverride"] = 0
         self.thermostats[index]["schedEnabled"] = False
+        self._clear_override_started(index)
         return self.make_request(index, body, log_msg_action)
+
+    def set_away_setpoints(self, index, heat_temp=None, cool_temp=None):
+        """Update away heat/cool setpoints without changing geofencing away mode."""
+        body = {}
+        if heat_temp is not None:
+            body["hspAway"] = round(heat_temp, 1)
+        if cool_temp is not None:
+            body["cspAway"] = round(cool_temp, 1)
+        if not body:
+            return None
+        return self.make_request(index, body, "set away setpoints")
 
     def set_away(self, index, mode, heat_temp=None, cool_temp=None):
         ''' Enable/Disable the away setting and optionally set the away temps '''
@@ -522,6 +1085,10 @@ class DaikinSkyport(object):
                 }
 
         log_msg_action = "resume program"
+        self.thermostats[index]["schedEnabled"] = True
+        self.thermostats[index]["schedOverride"] = 0
+        self.thermostats[index]["geofencingAway"] = False
+        self._clear_override_started(index)
         return self.make_request(index, body, log_msg_action)
 
     def set_fan_schedule(self, index, start, stop, interval, speed):

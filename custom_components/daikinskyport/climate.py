@@ -25,22 +25,29 @@ from homeassistant.components.climate.const import (
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_TEMPERATURE,
-    PRECISION_HALVES,
     PRECISION_TENTHS,
     STATE_OFF,
     STATE_ON,
     UnitOfTemperature,
 )
+from homeassistant.util.unit_conversion import TemperatureConverter
 
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityCategory
 
 from . import DaikinSkyportData
 
+from .logbook_helpers import format_temp_dual, format_temperature, temps_differ
+from .schedule_helpers import (
+    safe_format_next_scheduled_temperature,
+    safe_format_schedule_override_until,
+)
 from .const import (
     _LOGGER,
     DOMAIN,
@@ -64,8 +71,8 @@ HOLD_8HR = 480
 #Preset values
 PRESET_AWAY = "Away"
 PRESET_SCHEDULE = "Schedule"
-PRESET_MANUAL = "Manual"
-PRESET_TEMP_HOLD = "Temp Hold"
+PRESET_FIXED = "Fixed"
+PRESET_SCHEDULE_OVERRIDE = "Schedule Override"
 FAN_SCHEDULE = "Schedule"
 
 #Fan Schedule values
@@ -226,16 +233,26 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     """Add a Daikin Skyport Climate entity from a config_entry."""
+    from .schedule_climate import build_schedule_period_climate_entities
 
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator: DaikinSkyportData = data[COORDINATOR]
-    entities = []
+    climate_entities = []
+    thermostats: list[Thermostat] = []
 
     for index in range(len(coordinator.daikinskyport.thermostats)):
         thermostat = coordinator.daikinskyport.get_thermostat(index)
-        entities.append(Thermostat(coordinator, index, thermostat))
-    
-    async_add_entities(entities, True)
+        thermostats.append(Thermostat(coordinator, index, thermostat))
+        climate_entities.append(thermostats[-1])
+        if _thermostat_supports_away_climate(thermostat):
+            climate_entities.append(
+                DaikinSkyportAwayClimate(coordinator, index, thermostat)
+            )
+        climate_entities.extend(
+            build_schedule_period_climate_entities(coordinator, index, thermostat)
+        )
+
+    async_add_entities(climate_entities, True)
 
     def resume_program_set_service(service: ServiceCall) -> None:
         """Resume the schedule on the target thermostats."""
@@ -244,7 +261,7 @@ async def async_setup_entry(
         _LOGGER.info("Resuming program for %s", entity_ids)
         
         for entity in entity_ids:
-            for thermostat in entities:
+            for thermostat in thermostats:
                 if thermostat.entity_id == entity:
                     thermostat.resume_program()
                     _LOGGER.info("Program resumed for %s", entity)
@@ -264,7 +281,7 @@ async def async_setup_entry(
         _LOGGER.info("Setting fan schedule for %s", entity_ids)
         
         for entity in entity_ids:
-            for thermostat in entities:
+            for thermostat in thermostats:
                 if thermostat.entity_id == entity:
                     thermostat.set_fan_schedule(start, stop, interval, speed)
                     _LOGGER.info("Fan schedule set for %s", entity)
@@ -283,7 +300,7 @@ async def async_setup_entry(
         _LOGGER.info("Setting night mode for %s", entity_ids)
         
         for entity in entity_ids:
-            for thermostat in entities:
+            for thermostat in thermostats:
                 if thermostat.entity_id == entity:
                     thermostat.set_night_mode(start, stop, enable)
                     _LOGGER.info("Night mode set for %s", entity)
@@ -305,7 +322,7 @@ async def async_setup_entry(
         _LOGGER.info("Setting thermostat schedule for %s", entity_ids)
         
         for entity in entity_ids:
-            for thermostat in entities:
+            for thermostat in thermostats:
                 if thermostat.entity_id == entity:
                     thermostat.set_thermostat_schedule(day, start, part, enable, label, heating, cooling)
                     _LOGGER.info("Thermostat schedule set for %s", entity)
@@ -321,7 +338,7 @@ async def async_setup_entry(
         _LOGGER.info("Setting OneClean for %s", entity_ids)
         
         for entity in entity_ids:
-            for thermostat in entities:
+            for thermostat in thermostats:
                 if thermostat.entity_id == entity:
                     thermostat.set_oneclean(enable)
                     _LOGGER.info("OneClean set for %s", entity)
@@ -337,7 +354,7 @@ async def async_setup_entry(
         _LOGGER.info("Setting efficiency for %s", entity_ids)
         
         for entity in entity_ids:
-            for thermostat in entities:
+            for thermostat in thermostats:
                 if thermostat.entity_id == entity:
                     thermostat.set_efficiency(enable)
                     _LOGGER.info("Efficiency set for %s", entity)
@@ -386,25 +403,45 @@ async def async_setup_entry(
         schema=EFFICIENCY_SCHEMA,
     )
 
-class Thermostat(ClimateEntity):
+# Native-unit step matching 1°F when HA displays Fahrenheit.
+FAHRENHEIT_PRECISION_CELSIUS = 5 / 9
+
+# Away setpoint limits (API native °C).
+AWAY_SETPOINT_MIN_C = 7.0
+AWAY_SETPOINT_MAX_C = 35.0
+
+
+def _thermostat_has_cooling(thermostat: dict) -> bool:
+    """Return True when the system supports cooling."""
+    return (
+        thermostat.get("ctOutdoorNoofCoolStages", 0) > 0
+        or thermostat.get("P1P2S21CoolingCapability") is True
+    )
+
+
+def _thermostat_supports_away_climate(thermostat: dict) -> bool:
+    """Return True when away heat and/or cool setpoints can be configured."""
+    return bool(thermostat.get("ctSystemCapHeat")) or _thermostat_has_cooling(thermostat)
+
+
+class Thermostat(CoordinatorEntity, ClimateEntity):
     """A thermostat class for Daikin Skyport Thermostats."""
 
-    _attr_precision = PRECISION_TENTHS
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_fan_modes = [FAN_AUTO, FAN_ON, FAN_LOW, FAN_MEDIUM, FAN_HIGH, FAN_SCHEDULE]
     _attr_name = None
     _attr_has_entity_name = True
     _enable_turn_on_off_backwards_compatibility = False
 
-    def __init__(self, data, thermostat_index, thermostat):
+    def __init__(self, coordinator, thermostat_index, thermostat):
         """Initialize the thermostat."""
-        self.data = data
+        super().__init__(coordinator)
+        self.data = coordinator
         self.thermostat_index = thermostat_index
         self.thermostat = thermostat
         self._name = self.thermostat["name"]
         self._attr_unique_id = f"{self.thermostat['id']}-climate"
-        self._cool_setpoint = self.thermostat["cspActive"]
-        self._heat_setpoint = self.thermostat["hspActive"]
+        self._heat_setpoint, self._cool_setpoint = self._target_setpoints(self.thermostat)
         self._hvac_mode = DAIKIN_HVAC_TO_HASS[self.thermostat["mode"]]
         if DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculate"]] == FAN_ON:
             self._fan_mode = DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculateSpeed"] + 3]
@@ -414,11 +451,11 @@ class Thermostat(ClimateEntity):
         if self.thermostat["geofencingAway"]:
             self._preset_mode = PRESET_AWAY
         elif self.thermostat["schedOverride"] == 1:
-            self._preset_mode = PRESET_TEMP_HOLD
+            self._preset_mode = PRESET_SCHEDULE_OVERRIDE
         elif self.thermostat["schedEnabled"]:
             self._preset_mode = PRESET_SCHEDULE
         else:
-            self._preset_mode = PRESET_MANUAL
+            self._preset_mode = PRESET_FIXED
 
         self._operation_list = []
         if self.thermostat["ctSystemCapHeat"]:
@@ -431,24 +468,141 @@ class Thermostat(ClimateEntity):
         self._operation_list.append(HVACMode.OFF)
 
         self._preset_modes = {PRESET_SCHEDULE,
-                              PRESET_MANUAL,
-                              PRESET_TEMP_HOLD,
+                              PRESET_FIXED,
+                              PRESET_SCHEDULE_OVERRIDE,
                               PRESET_AWAY
                               }
         self._fan_modes = [FAN_AUTO, FAN_ON, FAN_LOW, FAN_MEDIUM, FAN_HIGH, FAN_SCHEDULE]
         self.update_without_throttle = False
+        self._logbook_previous = None
 
-    async def async_update(self):
-        """Get the latest state from the thermostat."""
-        if self.update_without_throttle:
-            await self.data._async_update_data(no_throttle=True)
-            self.update_without_throttle = False
+    @staticmethod
+    def _schedule_display_setpoints(thermostat):
+        """Return setpoints for the current schedule period (UI only)."""
+        heat = thermostat.get("hspSched", thermostat.get("hspActive"))
+        cool = thermostat.get("cspSched", thermostat.get("cspActive"))
+        return heat, cool
+
+    @staticmethod
+    def _target_setpoints(thermostat):
+        """Return display setpoints; holds use hspHome/cspHome, schedule uses sched/active."""
+        if thermostat.get("schedOverride") == 1 or not thermostat.get("schedEnabled"):
+            return (
+                thermostat.get("hspHome", thermostat["hspActive"]),
+                thermostat.get("cspHome", thermostat["cspActive"]),
+            )
+        return Thermostat._schedule_display_setpoints(thermostat)
+
+    def _apply_schedule_display_setpoints(self) -> None:
+        """Update displayed targets to the current schedule period (no temp PUT)."""
+        self._heat_setpoint, self._cool_setpoint = self._schedule_display_setpoints(
+            self.thermostat
+        )
+
+    def _logbook_snapshot(self) -> dict:
+        """Capture climate settings for logbook change detection."""
+        return {
+            "hvac_mode": self._hvac_mode,
+            "heat": self._heat_setpoint,
+            "cool": self._cool_setpoint,
+            "preset": self._preset_mode,
+            "fan_mode": self._fan_mode,
+        }
+
+    def _log_from_ha(self, message: str) -> None:
+        """Record an HA-initiated control change in the logbook."""
+        self.coordinator.mark_ha_control_change(self.thermostat_index)
+        self.coordinator.log_climate_entry(
+            self.entity_id,
+            self.name,
+            f"[Home Assistant] {message}",
+        )
+
+    def _log_from_cloud(self, message: str) -> None:
+        """Record a cloud/thermostat-initiated change in the logbook."""
+        self.coordinator.log_climate_entry(
+            self.entity_id,
+            self.name,
+            f"[Thermostat/cloud] {message}",
+        )
+
+    def _log_ha_temperature_change(self, heat_temp, cool_temp) -> None:
+        """Logbook entry for a temperature setpoint change from HA."""
+        if self._hvac_mode == HVACMode.AUTO:
+            self._log_from_ha(
+                f"Set heat target to {format_temperature(self.hass,heat_temp)} and "
+                f"cool target to {format_temperature(self.hass,cool_temp)}"
+            )
+        elif self._hvac_mode == HVACMode.HEAT:
+            self._log_from_ha(f"Set heat target to {format_temperature(self.hass,heat_temp)}")
+        elif self._hvac_mode == HVACMode.COOL:
+            self._log_from_ha(f"Set cool target to {format_temperature(self.hass,cool_temp)}")
         else:
-            await self.data._async_update_data()
+            self._log_from_ha(
+                f"Set heat target to {format_temperature(self.hass,heat_temp)} and "
+                f"cool target to {format_temperature(self.hass,cool_temp)}"
+            )
 
-        self.thermostat = self.data.daikinskyport.get_thermostat(self.thermostat_index)
-        self._cool_setpoint = self.thermostat["cspActive"]
-        self._heat_setpoint = self.thermostat["hspActive"]
+    def _detect_cloud_logbook_changes(self, previous: dict) -> None:
+        """Log settings that changed on a poll without a recent HA command."""
+        if not self.coordinator.should_log_cloud_change(self.thermostat_index):
+            return
+
+        current = self._logbook_snapshot()
+
+        if previous.get("hvac_mode") != current["hvac_mode"]:
+            self._log_from_cloud(
+                f"HVAC mode changed to {current['hvac_mode']} "
+                f"(was {previous.get('hvac_mode')})"
+            )
+
+        if temps_differ(previous.get("heat"), current["heat"]) or temps_differ(
+            previous.get("cool"), current["cool"]
+        ):
+            if self._hvac_mode == HVACMode.AUTO:
+                self._log_from_cloud(
+                    f"Targets changed to heat {format_temperature(self.hass,current['heat'])} / "
+                    f"cool {format_temperature(self.hass,current['cool'])} "
+                    f"(was heat {format_temperature(self.hass,previous.get('heat'))} / "
+                    f"cool {format_temperature(self.hass,previous.get('cool'))})"
+                )
+            elif self._hvac_mode == HVACMode.HEAT:
+                self._log_from_cloud(
+                    f"Heat target changed to {format_temperature(self.hass,current['heat'])} "
+                    f"(was {format_temperature(self.hass,previous.get('heat'))})"
+                )
+            elif self._hvac_mode == HVACMode.COOL:
+                self._log_from_cloud(
+                    f"Cool target changed to {format_temperature(self.hass,current['cool'])} "
+                    f"(was {format_temperature(self.hass,previous.get('cool'))})"
+                )
+            else:
+                self._log_from_cloud(
+                    f"Targets changed to heat {format_temperature(self.hass,current['heat'])} / "
+                    f"cool {format_temperature(self.hass,current['cool'])}"
+                )
+
+        if previous.get("preset") != current["preset"]:
+            self._log_from_cloud(
+                f"Preset changed to {current['preset']} (was {previous.get('preset')})"
+            )
+
+        if previous.get("fan_mode") != current["fan_mode"]:
+            self._log_from_cloud(
+                f"Fan mode changed to {current['fan_mode']} "
+                f"(was {previous.get('fan_mode')})"
+            )
+
+    def _promote_schedule_to_override_preset(self) -> None:
+        """Show Schedule Override immediately after a temp hold from Schedule mode."""
+        if self._preset_mode == PRESET_SCHEDULE:
+            self._preset_mode = PRESET_SCHEDULE_OVERRIDE
+
+    def _apply_thermostat_state(self) -> None:
+        """Refresh entity attributes from the coordinator cache."""
+        previous = self._logbook_previous
+        self.thermostat = self.coordinator.daikinskyport.get_thermostat(self.thermostat_index)
+        self._heat_setpoint, self._cool_setpoint = self._target_setpoints(self.thermostat)
         self._hvac_mode = DAIKIN_HVAC_TO_HASS[self.thermostat["mode"]]
         if DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculate"]] == FAN_ON:
             self._fan_mode = DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculateSpeed"] + 3]
@@ -458,11 +612,31 @@ class Thermostat(ClimateEntity):
         if self.thermostat["geofencingAway"]:
             self._preset_mode = PRESET_AWAY
         elif self.thermostat["schedOverride"] == 1:
-            self._preset_mode = PRESET_TEMP_HOLD
+            self._preset_mode = PRESET_SCHEDULE_OVERRIDE
         elif self.thermostat["schedEnabled"]:
             self._preset_mode = PRESET_SCHEDULE
         else:
-            self._preset_mode = PRESET_MANUAL
+            self._preset_mode = PRESET_FIXED
+
+        if previous is not None:
+            self._detect_cloud_logbook_changes(previous)
+        self._logbook_previous = self._logbook_snapshot()
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._apply_thermostat_state()
+        self.async_write_ha_state()
+
+    async def async_update(self):
+        """Get the latest state from the thermostat."""
+        if self.update_without_throttle:
+            # Use optimistic local cache immediately; poll server after a short delay.
+            self.update_without_throttle = False
+            self._apply_thermostat_state()
+            self.coordinator.async_set_updated_data(None)
+            self.coordinator.schedule_post_write_refresh()
+            return
+        await self.coordinator.async_request_refresh()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -484,22 +658,47 @@ class Thermostat(ClimateEntity):
         return self.thermostat["name"]
 
     @property
+    def precision(self) -> float:
+        """Return display precision in native °C (whole °F when user prefers F)."""
+        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
+            return FAHRENHEIT_PRECISION_CELSIUS
+        return PRECISION_TENTHS
+
+    def _temperature_for_display(self, temp_c: float | None) -> float | None:
+        """Round API Celsius for HA UI (whole °F, 0.1 °C)."""
+        if temp_c is None:
+            return None
+        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
+            fahrenheit = TemperatureConverter.convert(
+                temp_c,
+                UnitOfTemperature.CELSIUS,
+                UnitOfTemperature.FAHRENHEIT,
+            )
+            fahrenheit = round(fahrenheit)
+            return TemperatureConverter.convert(
+                fahrenheit,
+                UnitOfTemperature.FAHRENHEIT,
+                UnitOfTemperature.CELSIUS,
+            )
+        return round(temp_c, 1)
+
+    @property
     def current_temperature(self) -> float:
         """Return the current temperature."""
-        return self.thermostat["tempIndoor"]
+        return self._temperature_for_display(self.thermostat["tempIndoor"])
 
     @property
     def target_temperature_low(self):
         """Return the lower bound temperature we try to reach."""
         if self.hvac_mode == HVACMode.AUTO:
-            return self._heat_setpoint
+            return self._temperature_for_display(self._heat_setpoint)
         return None
 
     @property
     def target_temperature_high(self):
         """Return the upper bound temperature we try to reach."""
         if self.hvac_mode == HVACMode.AUTO:
-            return self._cool_setpoint
+            return self._temperature_for_display(self._cool_setpoint)
         return None
 
     @property
@@ -508,9 +707,9 @@ class Thermostat(ClimateEntity):
         if self.hvac_mode == HVACMode.AUTO:
             return None
         if self.hvac_mode == HVACMode.HEAT:
-            return self._heat_setpoint
+            return self._temperature_for_display(self._heat_setpoint)
         if self.hvac_mode == HVACMode.COOL:
-            return self._cool_setpoint
+            return self._temperature_for_display(self._cool_setpoint)
         return None
 
     @property
@@ -609,6 +808,12 @@ class Thermostat(ClimateEntity):
         return {
             "fan": self.fan,
             "schedule_mode": self.thermostat["schedEnabled"],
+            "schedule_override_until": safe_format_schedule_override_until(
+                self.thermostat
+            ),
+            "next_scheduled_temperature": safe_format_next_scheduled_temperature(
+                self.thermostat, hass=self.hass
+            ),
             "fan_cfm": fan_cfm,
             "fan_demand": fan_demand,
             "cooling_demand": cooling_demand,
@@ -631,22 +836,26 @@ class Thermostat(ClimateEntity):
         if preset_mode == self.preset_mode:
             return
 
+        ok = False
         if preset_mode == PRESET_AWAY:
-            self.data.daikinskyport.set_away(self.thermostat_index, True)
+            ok = bool(self.data.daikinskyport.set_away(self.thermostat_index, True))
 
         elif preset_mode == PRESET_SCHEDULE:
             self.data.daikinskyport.set_away(self.thermostat_index, False)
-            self.resume_program()
+            ok = bool(self.resume_program(log=False))
 
-        elif preset_mode == PRESET_MANUAL:
+        elif preset_mode == PRESET_FIXED:
             self.data.daikinskyport.set_away(self.thermostat_index, False)
-            self.data.daikinskyport.set_permanent_hold(self.thermostat_index)
+            ok = bool(self.data.daikinskyport.set_permanent_hold(self.thermostat_index))
             
-        elif preset_mode == PRESET_TEMP_HOLD:
+        elif preset_mode == PRESET_SCHEDULE_OVERRIDE:
             self.data.daikinskyport.set_away(self.thermostat_index, False)
-            self.data.daikinskyport.set_temp_hold(self.thermostat_index)
+            ok = bool(self.data.daikinskyport.set_temp_hold(self.thermostat_index))
         else:
             return
+
+        if ok:
+            self._log_from_ha(f"Set preset to {preset_mode}")
         
         self._preset_mode = preset_mode
 
@@ -669,29 +878,34 @@ class Thermostat(ClimateEntity):
         else:
             heat_temp_setpoint = self.thermostat["hspHome"]
 
-        if self._preset_mode == PRESET_MANUAL:
-            self.data.daikinskyport.set_permanent_hold(
+        was_schedule_preset = self._preset_mode == PRESET_SCHEDULE
+
+        if self._preset_mode == PRESET_FIXED:
+            result = self.data.daikinskyport.set_permanent_hold(
                 self.thermostat_index,
                 cool_temp_setpoint,
                 heat_temp_setpoint
         )
         else:
-            self.data.daikinskyport.set_temp_hold(
+            result = self.data.daikinskyport.set_temp_hold(
                 self.thermostat_index,
                 cool_temp_setpoint,
                 heat_temp_setpoint,
                 self.hold_preference(),
         )
+
+        if result:
+            if was_schedule_preset:
+                self._promote_schedule_to_override_preset()
+            self._log_ha_temperature_change(heat_temp_setpoint, cool_temp_setpoint)
         
         self._cool_setpoint = cool_temp_setpoint
         self._heat_setpoint = heat_temp_setpoint
         
         _LOGGER.debug(
-            "Setting Daikin Skyport hold_temp to: heat=%s, is=%s, " "cool=%s, is=%s",
-            heat_temp,
-            isinstance(heat_temp, (int, float)),
-            cool_temp,
-            isinstance(cool_temp, (int, float)),
+            "Setting Daikin Skyport hold_temp to: heat=%s cool=%s",
+            format_temp_dual(heat_temp),
+            format_temp_dual(cool_temp),
         )
 
         self.update_without_throttle = True
@@ -699,13 +913,16 @@ class Thermostat(ClimateEntity):
     def set_fan_mode(self, fan_mode):
         """Set the fan mode.  Valid values are "on", "auto", or "schedule"."""
         if fan_mode in {FAN_ON, FAN_AUTO, FAN_SCHEDULE}:
-            self.data.daikinskyport.set_fan_mode(
+            result = self.data.daikinskyport.set_fan_mode(
                 self.thermostat_index,
                 FAN_TO_DAIKIN_FAN[fan_mode]
             )
             
             self._fan_mode = fan_mode
             self.update_without_throttle = True
+
+            if result:
+                self._log_from_ha(f"Set fan mode to {fan_mode}")
 
             _LOGGER.debug("Setting fan mode to: %s", fan_mode)
         elif fan_mode in {FAN_LOW, FAN_MEDIUM, FAN_HIGH}:
@@ -720,13 +937,16 @@ class Thermostat(ClimateEntity):
 
                 _LOGGER.debug("Setting fan mode to: %s", fan_mode)
 
-            self.data.daikinskyport.set_fan_speed(
+            result = self.data.daikinskyport.set_fan_speed(
                 self.thermostat_index,
                 FAN_TO_DAIKIN_FAN[fan_mode]
             )
             
             self._fan_speed = FAN_TO_DAIKIN_FAN[fan_mode]
             self.update_without_throttle = True
+
+            if result:
+                self._log_from_ha(f"Set fan speed to {fan_mode}")
 
             _LOGGER.debug("Setting fan speed to: %s", self._fan_speed)
         else:
@@ -763,9 +983,6 @@ class Thermostat(ClimateEntity):
         else:
             _LOGGER.error("Missing valid arguments for set_temperature in %s", kwargs)
 
-        self._cool_setpoint = high_temp
-        self._heat_setpoint = low_temp
-
 
     def set_humidity(self, humidity):
         """Set the humidity level."""
@@ -779,16 +996,25 @@ class Thermostat(ClimateEntity):
         if daikin_value is None:
             _LOGGER.error("Invalid mode for set_hvac_mode: %s", hvac_mode)
             return
-        self.data.daikinskyport.set_hvac_mode(self.thermostat_index, daikin_value)
+        if self.data.daikinskyport.set_hvac_mode(self.thermostat_index, daikin_value):
+            self._log_from_ha(f"Set HVAC mode to {hvac_mode}")
         self._hvac_mode = hvac_mode
         self.update_without_throttle = True
 
-    def resume_program(self):
+    def resume_program(self, log=True):
         """Resume the thermostat schedule program."""
-        self.data.daikinskyport.resume_program(
+        result = self.data.daikinskyport.resume_program(
             self.thermostat_index
         )
+        if result:
+            if log:
+                self._log_from_ha("Resumed schedule program")
+            self.thermostat = self.data.daikinskyport.get_thermostat(
+                self.thermostat_index
+            )
+            self._apply_schedule_display_setpoints()
         self.update_without_throttle = True
+        return result
 
     def set_fan_schedule(self, start=None, stop=None, interval=None, speed=None):
         """Set the thermostat fan schedule."""
@@ -864,3 +1090,153 @@ class Thermostat(ClimateEntity):
         if isinstance(default, int):
             return default
         return HOLD_NEXT_TRANSITION
+
+
+class DaikinSkyportAwayClimate(CoordinatorEntity, ClimateEntity):
+    """Minimal climate control for away heat/cool setpoints (min/max only)."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_has_entity_name = True
+    _attr_translation_key = "away_settings"
+    _attr_icon = "mdi:home-export-outline"
+    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_min_temp = AWAY_SETPOINT_MIN_C
+    _attr_max_temp = AWAY_SETPOINT_MAX_C
+    _attr_hvac_action = None
+    _attr_preset_mode = None
+    _attr_current_temperature = None
+
+    def __init__(self, coordinator, thermostat_index: int, thermostat: dict) -> None:
+        """Initialize away setpoint climate entity."""
+        super().__init__(coordinator)
+        self.data = coordinator
+        self.thermostat_index = thermostat_index
+        self.thermostat = thermostat
+        self._has_heat = bool(thermostat.get("ctSystemCapHeat"))
+        self._has_cool = _thermostat_has_cooling(thermostat)
+        self._use_range = self._has_heat and self._has_cool
+        if self._use_range:
+            self._attr_hvac_modes = [HVACMode.HEAT_COOL]
+            self._attr_hvac_mode = HVACMode.HEAT_COOL
+        elif self._has_heat:
+            self._attr_hvac_modes = [HVACMode.HEAT]
+            self._attr_hvac_mode = HVACMode.HEAT
+        else:
+            self._attr_hvac_modes = [HVACMode.COOL]
+            self._attr_hvac_mode = HVACMode.COOL
+        self._attr_unique_id = f"{thermostat['id']}-away-climate"
+
+    @property
+    def supported_features(self) -> ClimateEntityFeature:
+        """Only target temperature (single or heat/cool range)."""
+        if self._use_range:
+            return ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        return ClimateEntityFeature.TARGET_TEMPERATURE
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return self.data.device_info
+
+    @property
+    def precision(self) -> float:
+        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
+            return FAHRENHEIT_PRECISION_CELSIUS
+        return PRECISION_TENTHS
+
+    def _temperature_for_display(self, temp_c: float | None) -> float | None:
+        if temp_c is None:
+            return None
+        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
+            fahrenheit = TemperatureConverter.convert(
+                temp_c,
+                UnitOfTemperature.CELSIUS,
+                UnitOfTemperature.FAHRENHEIT,
+            )
+            fahrenheit = round(fahrenheit)
+            return TemperatureConverter.convert(
+                fahrenheit,
+                UnitOfTemperature.FAHRENHEIT,
+                UnitOfTemperature.CELSIUS,
+            )
+        return round(temp_c, 1)
+
+    @property
+    def target_temperature_low(self) -> float | None:
+        if not self._use_range:
+            return None
+        return self._temperature_for_display(self.thermostat.get("hspAway"))
+
+    @property
+    def target_temperature_high(self) -> float | None:
+        if not self._use_range:
+            return None
+        return self._temperature_for_display(self.thermostat.get("cspAway"))
+
+    @property
+    def target_temperature(self) -> float | None:
+        if self._use_range:
+            return None
+        if self._has_heat:
+            return self._temperature_for_display(self.thermostat.get("hspAway"))
+        return self._temperature_for_display(self.thermostat.get("cspAway"))
+
+    async def async_set_temperature(self, **kwargs) -> None:
+        """Write away setpoints; does not change away mode or main thermostat holds."""
+        low_temp = kwargs.get(ATTR_TARGET_TEMP_LOW)
+        high_temp = kwargs.get(ATTR_TARGET_TEMP_HIGH)
+        temp = kwargs.get(ATTR_TEMPERATURE)
+        thermostat = self.coordinator.daikinskyport.get_thermostat(self.thermostat_index)
+
+        if self._use_range:
+            heat_temp = (
+                low_temp
+                if low_temp is not None
+                else thermostat.get("hspAway")
+            )
+            cool_temp = (
+                high_temp
+                if high_temp is not None
+                else thermostat.get("cspAway")
+            )
+        elif self._has_heat:
+            heat_temp = temp if temp is not None else thermostat.get("hspAway")
+            cool_temp = None
+        else:
+            heat_temp = None
+            cool_temp = temp if temp is not None else thermostat.get("cspAway")
+
+        if heat_temp is None and cool_temp is None:
+            raise HomeAssistantError("No away setpoint temperature provided")
+
+        self.coordinator.mark_ha_control_change(self.thermostat_index)
+        ok = await self.hass.async_add_executor_job(
+            self.coordinator.daikinskyport.set_away_setpoints,
+            self.thermostat_index,
+            heat_temp,
+            cool_temp,
+        )
+        if not ok:
+            raise HomeAssistantError("Failed to set away settings")
+
+        self.thermostat = self.coordinator.daikinskyport.get_thermostat(
+            self.thermostat_index
+        )
+        self.coordinator.log_climate_entry(
+            self.entity_id,
+            self.name or "Away Settings",
+            (
+                f"[Home Assistant] Set away settings to heat "
+                f"{format_temp_dual(heat_temp)} / cool {format_temp_dual(cool_temp)}"
+            ),
+        )
+        self.coordinator.async_set_updated_data(
+            self.coordinator.daikinskyport.thermostats
+        )
+        self.coordinator.schedule_post_write_refresh()
+        self.async_write_ha_state()
+
+    def _handle_coordinator_update(self) -> None:
+        self.thermostat = self.coordinator.daikinskyport.get_thermostat(
+            self.thermostat_index
+        )
+        self.async_write_ha_state()

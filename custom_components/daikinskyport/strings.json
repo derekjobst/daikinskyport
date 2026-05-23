@@ -14,14 +14,30 @@
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "invalid_api_key": "[%key:common::config_flow::error::invalid_api_key%]",
+      "invalid_api_key": "[%key:common::config_flow::error::invalid_api_key%]"
     },
     "abort": {
       "single_instance_allowed": "[%key:common::config_flow::abort::single_instance_allowed%]"
     }
   },
   "entity": {
+    "switch": {
+      "rapid_poll_after_writes": {
+        "name": "Rapid poll after writes"
+      }
+    },
+    "climate": {
+      "away_settings": {
+        "name": "Away Settings"
+      }
+    },
     "sensor": {
+      "schedule_override_until": {
+        "name": "Schedule override until"
+      },
+      "next_scheduled_temperature": {
+        "name": "Next scheduled temperature"
+      },
       "pressure_tendency": {
         "state": {
           "steady": "Steady",
@@ -43,7 +59,7 @@
   },
   "system_health": {
     "info": {
-      "can_reach_server": "Reach Daikin Skyport server",
+      "can_reach_server": "Reach Daikin Skyport server"
     }
   }
 }
