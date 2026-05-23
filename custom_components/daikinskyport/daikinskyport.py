@@ -262,7 +262,7 @@ class DaikinSkyport(object):
                 self.write_tokens_to_file()
             return True
         else:
-            _LOGGER.warn("Could not refresh tokens, Trying to re-request. Status code: %s Message: %s ", request.status_code, request.text)
+            _LOGGER.warning("Could not refresh tokens, Trying to re-request. Status code: %s Message: %s ", request.status_code, request.text)
             result = self.request_tokens()
             if result is not None:
                 return True
@@ -369,7 +369,7 @@ class DaikinSkyport(object):
         try:
             request = http.get(url, headers=header)
         except RequestException as e:
-            _LOGGER.warn("Error connecting to Daikin Skyport.  Possible connectivity outage: %s", e)
+            _LOGGER.warning("Error connecting to Daikin Skyport.  Possible connectivity outage: %s", e)
             return None
         _log_api_response("GET", url, "list devices", request.status_code)
         if request.status_code == requests.codes.ok:
@@ -450,7 +450,7 @@ class DaikinSkyport(object):
             request.raise_for_status()
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 400 and e.response.json().get("message") == "DeviceOfflineException":
-                _LOGGER.warn("Device is offline: %s", deviceid)
+                _LOGGER.warning("Device is offline: %s", deviceid)
                 self.authenticated = True
                 return None
             else:
@@ -868,7 +868,7 @@ class DaikinSkyport(object):
         try:
             request = http.put(url, headers=header, json=body)
         except RequestException as e:
-            _LOGGER.warn("Error connecting to Daikin Skyport.  Possible connectivity outage: %s", e)
+            _LOGGER.warning("Error connecting to Daikin Skyport.  Possible connectivity outage: %s", e)
             return None
         response_data = _parse_response_json(request)
         _log_api_response(
@@ -889,7 +889,7 @@ class DaikinSkyport(object):
                 return self.make_request(index, body, log_msg_action,
                                          retry_count=retry_count + 1)
         else:
-            _LOGGER.warn(
+            _LOGGER.warning(
                 "Error fetching data from Daikin Skyport while attempting to %s: %s",
                 log_msg_action, request.json())
             return None

@@ -24,6 +24,7 @@ from .schedule_helpers import (
     safe_format_next_scheduled_temperature,
     safe_format_schedule_override_until,
 )
+from .sync_helpers import has_pending_write_batches, pending_batch_summaries
 
 from .const import (
     COORDINATOR,
@@ -216,6 +217,9 @@ async def async_setup_entry(
                 coordinator, thermostat["name"], index
             )
         )
+        entities.append(
+            DaikinSkyportCloudSyncStatusSensor(coordinator, index)
+        )
         for sensor in coordinator.daikinskyport.get_sensors(index):
             if sensor["type"] not in ENABLED_SENSOR_TYPES:
                 continue
@@ -334,6 +338,57 @@ class DaikinSkyportNextScheduledTemperatureSensor(CoordinatorEntity, SensorEntit
             return None
         thermostat = self.coordinator.daikinskyport.get_thermostat(self._index)
         return safe_format_next_scheduled_temperature(thermostat, hass=self.hass)
+
+    async def async_added_to_hass(self) -> None:
+        """Run when entity is added to Home Assistant."""
+        await super().async_added_to_hass()
+        self._write_state_from_coordinator()
+
+    @callback
+    def _write_state_from_coordinator(self) -> None:
+        """Push coordinator data to the entity state."""
+        self.async_write_ha_state()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._write_state_from_coordinator()
+
+
+class DaikinSkyportCloudSyncStatusSensor(CoordinatorEntity, SensorEntity):
+    """Shows whether optimistic writes are waiting for cloud confirmation."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["synced", "waiting"]
+    _attr_icon = "mdi:cloud-sync"
+    _attr_has_entity_name = True
+    _attr_translation_key = "cloud_sync_status"
+
+    def __init__(self, coordinator, index: int) -> None:
+        """Initialize the cloud sync status sensor."""
+        super().__init__(coordinator)
+        self._index = index
+        device_id = coordinator.daikinskyport.thermostats[index]["id"]
+        self._attr_unique_id = f"{device_id}-cloud_sync_status"
+        self._attr_device_info = coordinator.device_info
+
+    @property
+    def native_value(self) -> str:
+        """Return synced or waiting depending on pending write batches."""
+        thermostat = self.coordinator.daikinskyport.get_thermostat(self._index)
+        if has_pending_write_batches(thermostat):
+            return "waiting"
+        return "synced"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, list[str]]:
+        """Return pending PUT action labels while waiting for cloud sync."""
+        thermostat = self.coordinator.daikinskyport.get_thermostat(self._index)
+        actions = pending_batch_summaries(thermostat)
+        if not actions:
+            return {}
+        return {"pending_actions": actions}
 
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to Home Assistant."""

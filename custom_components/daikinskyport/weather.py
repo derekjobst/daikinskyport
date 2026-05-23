@@ -1,8 +1,5 @@
 """Support for displaying weather info from Daikin Skyport API."""
-from datetime import datetime, timedelta
-from pytz import timezone, utc
-import logging
-# hello world
+from datetime import timedelta
 
 from homeassistant.components.weather import (
     ATTR_FORECAST_CONDITION,

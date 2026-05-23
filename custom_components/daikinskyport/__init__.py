@@ -34,8 +34,6 @@ from .const import (
 POST_WRITE_REFRESH_DELAY = HOLD_PENDING_SECONDS
 UNDO_UPDATE_LISTENER = "undo_update_listener"
 
-NETWORK = None
-
 PLATFORMS = [
     Platform.SENSOR,
     Platform.WEATHER,
@@ -55,12 +53,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     password: str = entry.data[CONF_PASSWORD]
     try:
         name: str = entry.options[CONF_NAME]
-    except (NameError, KeyError):
+    except KeyError:
         name: str = entry.data[CONF_NAME]
     try:
         access_token: str = entry.data[CONF_ACCESS_TOKEN]
         refresh_token: str = entry.data[CONF_REFRESH_TOKEN]
-    except (NameError, KeyError):
+    except KeyError:
         _LOGGER.debug("Tokens not in config for Daikin Skyport")
         access_token = ""
         refresh_token = ""
@@ -81,16 +79,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await coordinator.async_config_entry_first_refresh()
     except ExpiredTokenError:
-        _LOGGER.warn("Unable to refresh auth token.")
+        _LOGGER.warning("Unable to refresh auth token.")
         raise ConfigEntryNotReady("Unable to refresh token.") from None
 
     if coordinator.daikinskyport.thermostats is None:
         _LOGGER.error("No Daikin Skyport devices found to set up")
         return False
-
-    for platform in PLATFORMS:
-        if entry.options.get(platform, True):
-            coordinator.platforms.append(platform)
 
     undo_listener = entry.add_update_listener(update_listener)
 
@@ -129,8 +123,8 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 
 async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Update listener."""
-    _LOGGER.debug("Update listener: %s", str(entry))
+    """Reload the config entry when options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 class DaikinSkyportData(DataUpdateCoordinator):
@@ -150,10 +144,9 @@ class DaikinSkyportData(DataUpdateCoordinator):
             name=DOMAIN,
             update_interval=UPDATE_INTERVAL,
         )
-        self.platforms = []
         try:
             self.name: str = entry.options[CONF_NAME]
-        except (NameError, KeyError):
+        except KeyError:
             self.name: str = entry.data[CONF_NAME]
         self.entry = entry
         self.unique_id = unique_id
@@ -171,6 +164,13 @@ class DaikinSkyportData(DataUpdateCoordinator):
         self._rapid_poll_index: int | None = None
         self._rapid_poll_sample = 0
         self.daikinskyport.on_put_success = self._on_put_success
+        self._climate_log_targets: dict[int, tuple[str, str]] = {}
+
+    def register_climate_entity(
+        self, thermostat_index: int, entity_id: str, name: str
+    ) -> None:
+        """Register the main climate entity for logbook messages."""
+        self._climate_log_targets[thermostat_index] = (entity_id, name)
 
     def outdoor_weather_device_info(self, thermostat_index: int) -> DeviceInfo:
         """Device for cloud outdoor weather and related outdoor air readings."""
@@ -192,9 +192,31 @@ class DaikinSkyportData(DataUpdateCoordinator):
 
     def should_log_cloud_change(self, thermostat_index: int) -> bool:
         """Return True when a poll change is likely external (thermostat/cloud)."""
-        return time.time() >= self._suppress_cloud_log_until.get(
-            thermostat_index, 0
-        )
+        if time.time() < self._suppress_cloud_log_until.get(thermostat_index, 0):
+            return False
+        if self.daikinskyport.has_pending_writes(thermostat_index):
+            return False
+        return True
+
+    @callback
+    def _dispatch_sync_log_events(self) -> None:
+        """Write logbook entries for confirmed or timed-out cloud sync batches."""
+        from .sync_helpers import format_sync_event_message, pop_sync_log_events
+
+        for index, thermostat in enumerate(self.daikinskyport.thermostats):
+            events = pop_sync_log_events(thermostat)
+            if not events:
+                continue
+            target = self._climate_log_targets.get(index)
+            if not target:
+                continue
+            entity_id, name = target
+            for event in events:
+                self.log_climate_entry(
+                    entity_id,
+                    name,
+                    format_sync_event_message(event, hass=self.hass),
+                )
 
     @callback
     def _write_logbook_entry(
@@ -333,6 +355,7 @@ class DaikinSkyportData(DataUpdateCoordinator):
             await self.hass.async_add_executor_job(
                 self.daikinskyport.update, force, True
             )
+        self._dispatch_sync_log_events()
         return self.daikinskyport.thermostats
 
     async def async_force_cloud_refresh(
@@ -355,6 +378,8 @@ class DaikinSkyportData(DataUpdateCoordinator):
         await self.hass.async_add_executor_job(
             self.daikinskyport.update, True, not raw_cloud
         )
+        if not raw_cloud:
+            self._dispatch_sync_log_events()
         self.daikinskyport.log_cloud_snapshot(thermostat_index, context)
         self.async_set_updated_data(self.daikinskyport.thermostats)
 

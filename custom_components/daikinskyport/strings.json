@@ -38,6 +38,13 @@
       "next_scheduled_temperature": {
         "name": "Next scheduled temperature"
       },
+      "cloud_sync_status": {
+        "name": "Cloud sync status",
+        "state": {
+          "synced": "In sync",
+          "waiting": "Waiting for cloud"
+        }
+      },
       "pressure_tendency": {
         "state": {
           "steady": "Steady",

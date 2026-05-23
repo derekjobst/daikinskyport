@@ -14,7 +14,6 @@ from homeassistant.components.climate import (
 from homeassistant.components.climate.const import (
     ATTR_TARGET_TEMP_LOW,
     ATTR_TARGET_TEMP_HIGH,
-    PRESET_AWAY,
     FAN_AUTO,
     FAN_ON,
     FAN_LOW,
@@ -361,47 +360,48 @@ async def async_setup_entry(
                     thermostat.schedule_update_ha_state(True)
                     break
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_RESUME_PROGRAM,
-        resume_program_set_service,
-        schema=RESUME_PROGRAM_SCHEMA,
-    )
+    if not hass.services.has_service(DOMAIN, SERVICE_RESUME_PROGRAM):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_RESUME_PROGRAM,
+            resume_program_set_service,
+            schema=RESUME_PROGRAM_SCHEMA,
+        )
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_SET_FAN_SCHEDULE,
-        set_fan_schedule_service,
-        schema=FAN_SCHEDULE_SCHEMA,
-    )
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_FAN_SCHEDULE,
+            set_fan_schedule_service,
+            schema=FAN_SCHEDULE_SCHEMA,
+        )
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_SET_NIGHT_MODE,
-        set_night_mode_service,
-        schema=NIGHT_MODE_SCHEMA,
-    )
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_NIGHT_MODE,
+            set_night_mode_service,
+            schema=NIGHT_MODE_SCHEMA,
+        )
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_SET_THERMOSTAT_SCHEDULE,
-        set_thermostat_schedule_service,
-        schema=THERMOSTAT_SCHEDULE_SCHEMA,
-    )
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_THERMOSTAT_SCHEDULE,
+            set_thermostat_schedule_service,
+            schema=THERMOSTAT_SCHEDULE_SCHEMA,
+        )
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_SET_ONECLEAN,
-        set_oneclean_service,
-        schema=ONECLEAN_SCHEMA,
-    )
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_ONECLEAN,
+            set_oneclean_service,
+            schema=ONECLEAN_SCHEMA,
+        )
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_PRIORITIZE_EFFICIENCY,
-        set_efficiency_service,
-        schema=EFFICIENCY_SCHEMA,
-    )
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_PRIORITIZE_EFFICIENCY,
+            set_efficiency_service,
+            schema=EFFICIENCY_SCHEMA,
+        )
 
 # Native-unit step matching 1°F when HA displays Fahrenheit.
 FAHRENHEIT_PRECISION_CELSIUS = 5 / 9
@@ -523,7 +523,7 @@ class Thermostat(CoordinatorEntity, ClimateEntity):
         self.coordinator.log_climate_entry(
             self.entity_id,
             self.name,
-            f"[Thermostat/cloud] {message}",
+            f"[Cloud sync] External: {message}",
         )
 
     def _log_ha_temperature_change(self, heat_temp, cool_temp) -> None:
@@ -627,13 +627,22 @@ class Thermostat(CoordinatorEntity, ClimateEntity):
         self._apply_thermostat_state()
         self.async_write_ha_state()
 
+    async def async_added_to_hass(self) -> None:
+        """Register this entity for cloud sync logbook messages."""
+        await super().async_added_to_hass()
+        self.coordinator.register_climate_entity(
+            self.thermostat_index, self.entity_id, self.name or "Thermostat"
+        )
+
     async def async_update(self):
         """Get the latest state from the thermostat."""
         if self.update_without_throttle:
             # Use optimistic local cache immediately; poll server after a short delay.
             self.update_without_throttle = False
             self._apply_thermostat_state()
-            self.coordinator.async_set_updated_data(None)
+            self.coordinator.async_set_updated_data(
+                self.coordinator.daikinskyport.thermostats
+            )
             self.coordinator.schedule_post_write_refresh()
             return
         await self.coordinator.async_request_refresh()
