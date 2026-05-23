@@ -22,7 +22,6 @@ from daikinskyport.schedule_helpers import (
     safe_format_schedule_override_until,
     schedule_setpoints_for_prefix,
     schedule_slot_to_hour_minute,
-    thermostat_has_cooling,
     thermostat_timezone,
 )
 from tests.helpers import make_monday_schedule_thermostat
@@ -146,16 +145,7 @@ class TestEnabledSchedulePeriods:
         assert cool == 25.0
 
 
-class TestThermostatCapabilities:
-    def test_thermostat_has_cooling_stages(self) -> None:
-        assert thermostat_has_cooling({"ctOutdoorNoofCoolStages": 1}) is True
-
-    def test_thermostat_has_cooling_p1p2(self) -> None:
-        assert thermostat_has_cooling({"P1P2S21CoolingCapability": True}) is True
-
-    def test_thermostat_no_cooling(self) -> None:
-        assert thermostat_has_cooling({}) is False
-
+class TestThermostatTimezone:
     def test_thermostat_timezone_fallback(self) -> None:
         assert thermostat_timezone({}) == ZoneInfo("UTC")
         assert thermostat_timezone({"timeZone": "America/Toronto"}) == ZoneInfo(

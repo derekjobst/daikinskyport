@@ -6,6 +6,8 @@ from datetime import date, datetime, timedelta
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+from .thermostat_helpers import thermostat_has_cooling
+
 SCHEDULE_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 DAY_DISPLAY_NAMES = {
     "Mon": "Monday",
@@ -235,14 +237,6 @@ def schedule_setpoints_for_prefix(
     except (TypeError, ValueError):
         cool = None
     return heat, cool
-
-
-def thermostat_has_cooling(thermostat: dict[str, Any]) -> bool:
-    """Return True when the thermostat supports cooling."""
-    return (
-        thermostat.get("ctOutdoorNoofCoolStages", 0) > 0
-        or thermostat.get("P1P2S21CoolingCapability") is True
-    )
 
 
 def resolve_next_scheduled_setpoints(

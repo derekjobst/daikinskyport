@@ -58,6 +58,8 @@ def _install_ha_stubs() -> None:
     ha_components = types.ModuleType("homeassistant.components")
     ha_logbook = types.ModuleType("homeassistant.components.logbook")
     ha_logbook.async_log_entry = MagicMock()
+    ha_climate_const = types.ModuleType("homeassistant.components.climate.const")
+    ha_climate_const.PRECISION_TENTHS = 0.1
     ha_weather = types.ModuleType("homeassistant.components.weather")
     for name in (
         "ATTR_CONDITION_CLEAR_NIGHT",
@@ -83,8 +85,12 @@ def _install_ha_stubs() -> None:
 
     class _TemperatureConverter:
         @staticmethod
-        def convert(value: float, _from: str, _to: str) -> float:
-            return value * 9 / 5 + 32
+        def convert(value: float, from_unit: str, to_unit: str) -> float:
+            if from_unit == to_unit:
+                return value
+            if to_unit == _UnitOfTemperature.FAHRENHEIT:
+                return value * 9 / 5 + 32
+            return (value - 32) * 5 / 9
 
     ha_util_unit.TemperatureConverter = _TemperatureConverter
     ha_util.unit_conversion = ha_util_unit
@@ -99,6 +105,10 @@ def _install_ha_stubs() -> None:
     sys.modules["homeassistant.helpers.update_coordinator"] = ha_helpers_update
     sys.modules["homeassistant.helpers.entity"] = ha_helpers_entity
     sys.modules["homeassistant.components"] = ha_components
+    sys.modules["homeassistant.components.climate"] = types.ModuleType(
+        "homeassistant.components.climate"
+    )
+    sys.modules["homeassistant.components.climate.const"] = ha_climate_const
     sys.modules["homeassistant.components.logbook"] = ha_logbook
     sys.modules["homeassistant.components.weather"] = ha_weather
     sys.modules["homeassistant.util"] = ha_util

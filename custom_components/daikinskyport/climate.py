@@ -24,13 +24,10 @@ from homeassistant.components.climate.const import (
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_TEMPERATURE,
-    PRECISION_TENTHS,
     STATE_OFF,
     STATE_ON,
     UnitOfTemperature,
 )
-from homeassistant.util.unit_conversion import TemperatureConverter
-
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -46,6 +43,15 @@ from .logbook_helpers import format_temp_dual, format_temperature, temps_differ
 from .schedule_helpers import (
     safe_format_next_scheduled_temperature,
     safe_format_schedule_override_until,
+)
+from .thermostat_helpers import (
+    SETPOINT_MAX_C,
+    SETPOINT_MIN_C,
+    climate_precision,
+    temperature_for_display,
+    thermostat_has_cooling,
+    thermostat_has_heat,
+    thermostat_supports_setpoint_climate,
 )
 from .const import (
     _LOGGER,
@@ -243,7 +249,7 @@ async def async_setup_entry(
         thermostat = coordinator.daikinskyport.get_thermostat(index)
         thermostats.append(Thermostat(coordinator, index, thermostat))
         climate_entities.append(thermostats[-1])
-        if _thermostat_supports_away_climate(thermostat):
+        if thermostat_supports_setpoint_climate(thermostat):
             climate_entities.append(
                 DaikinSkyportAwayClimate(coordinator, index, thermostat)
             )
@@ -403,27 +409,6 @@ async def async_setup_entry(
             schema=EFFICIENCY_SCHEMA,
         )
 
-# Native-unit step matching 1°F when HA displays Fahrenheit.
-FAHRENHEIT_PRECISION_CELSIUS = 5 / 9
-
-# Away setpoint limits (API native °C).
-AWAY_SETPOINT_MIN_C = 7.0
-AWAY_SETPOINT_MAX_C = 35.0
-
-
-def _thermostat_has_cooling(thermostat: dict) -> bool:
-    """Return True when the system supports cooling."""
-    return (
-        thermostat.get("ctOutdoorNoofCoolStages", 0) > 0
-        or thermostat.get("P1P2S21CoolingCapability") is True
-    )
-
-
-def _thermostat_supports_away_climate(thermostat: dict) -> bool:
-    """Return True when away heat and/or cool setpoints can be configured."""
-    return bool(thermostat.get("ctSystemCapHeat")) or _thermostat_has_cooling(thermostat)
-
-
 class Thermostat(CoordinatorEntity, ClimateEntity):
     """A thermostat class for Daikin Skyport Thermostats."""
 
@@ -458,10 +443,9 @@ class Thermostat(CoordinatorEntity, ClimateEntity):
             self._preset_mode = PRESET_FIXED
 
         self._operation_list = []
-        if self.thermostat["ctSystemCapHeat"]:
+        if thermostat_has_heat(self.thermostat):
             self._operation_list.append(HVACMode.HEAT)
-        if (("ctOutdoorNoofCoolStages" in self.thermostat and self.thermostat["ctOutdoorNoofCoolStages"] > 0)
-        or  ("P1P2S21CoolingCapability" in self.thermostat and self.thermostat["P1P2S21CoolingCapability"] == True)):
+        if thermostat_has_cooling(self.thermostat):
             self._operation_list.append(HVACMode.COOL)
         if len(self._operation_list) == 2:
             self._operation_list.insert(0, HVACMode.AUTO)
@@ -669,45 +653,25 @@ class Thermostat(CoordinatorEntity, ClimateEntity):
     @property
     def precision(self) -> float:
         """Return display precision in native °C (whole °F when user prefers F)."""
-        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
-            return FAHRENHEIT_PRECISION_CELSIUS
-        return PRECISION_TENTHS
-
-    def _temperature_for_display(self, temp_c: float | None) -> float | None:
-        """Round API Celsius for HA UI (whole °F, 0.1 °C)."""
-        if temp_c is None:
-            return None
-        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
-            fahrenheit = TemperatureConverter.convert(
-                temp_c,
-                UnitOfTemperature.CELSIUS,
-                UnitOfTemperature.FAHRENHEIT,
-            )
-            fahrenheit = round(fahrenheit)
-            return TemperatureConverter.convert(
-                fahrenheit,
-                UnitOfTemperature.FAHRENHEIT,
-                UnitOfTemperature.CELSIUS,
-            )
-        return round(temp_c, 1)
+        return climate_precision(self.hass)
 
     @property
     def current_temperature(self) -> float:
         """Return the current temperature."""
-        return self._temperature_for_display(self.thermostat["tempIndoor"])
+        return temperature_for_display(self.hass, self.thermostat["tempIndoor"])
 
     @property
     def target_temperature_low(self):
         """Return the lower bound temperature we try to reach."""
         if self.hvac_mode == HVACMode.AUTO:
-            return self._temperature_for_display(self._heat_setpoint)
+            return temperature_for_display(self.hass, self._heat_setpoint)
         return None
 
     @property
     def target_temperature_high(self):
         """Return the upper bound temperature we try to reach."""
         if self.hvac_mode == HVACMode.AUTO:
-            return self._temperature_for_display(self._cool_setpoint)
+            return temperature_for_display(self.hass, self._cool_setpoint)
         return None
 
     @property
@@ -716,9 +680,9 @@ class Thermostat(CoordinatorEntity, ClimateEntity):
         if self.hvac_mode == HVACMode.AUTO:
             return None
         if self.hvac_mode == HVACMode.HEAT:
-            return self._temperature_for_display(self._heat_setpoint)
+            return temperature_for_display(self.hass, self._heat_setpoint)
         if self.hvac_mode == HVACMode.COOL:
-            return self._temperature_for_display(self._cool_setpoint)
+            return temperature_for_display(self.hass, self._cool_setpoint)
         return None
 
     @property
@@ -1109,8 +1073,8 @@ class DaikinSkyportAwayClimate(CoordinatorEntity, ClimateEntity):
     _attr_translation_key = "away_settings"
     _attr_icon = "mdi:home-export-outline"
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_min_temp = AWAY_SETPOINT_MIN_C
-    _attr_max_temp = AWAY_SETPOINT_MAX_C
+    _attr_min_temp = SETPOINT_MIN_C
+    _attr_max_temp = SETPOINT_MAX_C
     _attr_hvac_action = None
     _attr_preset_mode = None
     _attr_current_temperature = None
@@ -1121,8 +1085,8 @@ class DaikinSkyportAwayClimate(CoordinatorEntity, ClimateEntity):
         self.data = coordinator
         self.thermostat_index = thermostat_index
         self.thermostat = thermostat
-        self._has_heat = bool(thermostat.get("ctSystemCapHeat"))
-        self._has_cool = _thermostat_has_cooling(thermostat)
+        self._has_heat = thermostat_has_heat(thermostat)
+        self._has_cool = thermostat_has_cooling(thermostat)
         self._use_range = self._has_heat and self._has_cool
         if self._use_range:
             self._attr_hvac_modes = [HVACMode.HEAT_COOL]
@@ -1148,46 +1112,27 @@ class DaikinSkyportAwayClimate(CoordinatorEntity, ClimateEntity):
 
     @property
     def precision(self) -> float:
-        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
-            return FAHRENHEIT_PRECISION_CELSIUS
-        return PRECISION_TENTHS
-
-    def _temperature_for_display(self, temp_c: float | None) -> float | None:
-        if temp_c is None:
-            return None
-        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
-            fahrenheit = TemperatureConverter.convert(
-                temp_c,
-                UnitOfTemperature.CELSIUS,
-                UnitOfTemperature.FAHRENHEIT,
-            )
-            fahrenheit = round(fahrenheit)
-            return TemperatureConverter.convert(
-                fahrenheit,
-                UnitOfTemperature.FAHRENHEIT,
-                UnitOfTemperature.CELSIUS,
-            )
-        return round(temp_c, 1)
+        return climate_precision(self.hass)
 
     @property
     def target_temperature_low(self) -> float | None:
         if not self._use_range:
             return None
-        return self._temperature_for_display(self.thermostat.get("hspAway"))
+        return temperature_for_display(self.hass, self.thermostat.get("hspAway"))
 
     @property
     def target_temperature_high(self) -> float | None:
         if not self._use_range:
             return None
-        return self._temperature_for_display(self.thermostat.get("cspAway"))
+        return temperature_for_display(self.hass, self.thermostat.get("cspAway"))
 
     @property
     def target_temperature(self) -> float | None:
         if self._use_range:
             return None
         if self._has_heat:
-            return self._temperature_for_display(self.thermostat.get("hspAway"))
-        return self._temperature_for_display(self.thermostat.get("cspAway"))
+            return temperature_for_display(self.hass, self.thermostat.get("hspAway"))
+        return temperature_for_display(self.hass, self.thermostat.get("cspAway"))
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Write away setpoints; does not change away mode or main thermostat holds."""

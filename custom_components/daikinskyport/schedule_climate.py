@@ -10,40 +10,35 @@ from homeassistant.components.climate.const import (
 )
 from homeassistant.const import (
     ATTR_TEMPERATURE,
-    PRECISION_TENTHS,
     UnitOfTemperature,
 )
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.util.unit_conversion import TemperatureConverter
 
 from .logbook_helpers import format_temp_dual
 from .schedule_helpers import SchedulePeriod, iter_enabled_schedule_periods
-
-# Match away/settings climate limits (API native °C).
-SETPOINT_MIN_C = 7.0
-SETPOINT_MAX_C = 35.0
-FAHRENHEIT_PRECISION_CELSIUS = 5 / 9
-
-
-def _thermostat_has_cooling(thermostat: dict) -> bool:
-    return (
-        thermostat.get("ctOutdoorNoofCoolStages", 0) > 0
-        or thermostat.get("P1P2S21CoolingCapability") is True
-    )
+from .thermostat_helpers import (
+    SETPOINT_MAX_C,
+    SETPOINT_MIN_C,
+    climate_precision,
+    temperature_for_display,
+    thermostat_has_cooling,
+    thermostat_has_heat,
+    thermostat_supports_setpoint_climate,
+)
 
 
 def build_schedule_period_climate_entities(
     coordinator, thermostat_index: int, thermostat: dict
 ) -> list[ClimateEntity]:
     """Create one setpoint climate entity per enabled schedule period."""
-    if not (
-        thermostat.get("ctSystemCapHeat") or _thermostat_has_cooling(thermostat)
-    ):
+    if not thermostat_supports_setpoint_climate(thermostat):
         return []
     device_id = thermostat["id"]
+    has_heat = thermostat_has_heat(thermostat)
+    has_cool = thermostat_has_cooling(thermostat)
     entities: list[ClimateEntity] = []
     for period in iter_enabled_schedule_periods(thermostat):
         entities.append(
@@ -52,8 +47,8 @@ def build_schedule_period_climate_entities(
                 thermostat_index,
                 device_id,
                 period,
-                has_heat=bool(thermostat.get("ctSystemCapHeat")),
-                has_cool=_thermostat_has_cooling(thermostat),
+                has_heat=has_heat,
+                has_cool=has_cool,
             )
         )
     return entities
@@ -115,49 +110,35 @@ class DaikinSkyportSchedulePeriodClimate(CoordinatorEntity, ClimateEntity):
 
     @property
     def precision(self) -> float:
-        if (
-            self.hass.config.units.temperature_unit
-            == UnitOfTemperature.FAHRENHEIT
-        ):
-            return FAHRENHEIT_PRECISION_CELSIUS
-        return PRECISION_TENTHS
-
-    def _temperature_for_display(self, temp_c: float | None) -> float | None:
-        if temp_c is None:
-            return None
-        if self.hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT:
-            fahrenheit = TemperatureConverter.convert(
-                temp_c,
-                UnitOfTemperature.CELSIUS,
-                UnitOfTemperature.FAHRENHEIT,
-            )
-            fahrenheit = round(fahrenheit)
-            return TemperatureConverter.convert(
-                fahrenheit,
-                UnitOfTemperature.FAHRENHEIT,
-                UnitOfTemperature.CELSIUS,
-            )
-        return round(temp_c, 1)
+        return climate_precision(self.hass)
 
     @property
     def target_temperature_low(self) -> float | None:
         if not self._use_range:
             return None
-        return self._temperature_for_display(self.thermostat.get(self._hsp_key))
+        return temperature_for_display(
+            self.hass, self.thermostat.get(self._hsp_key)
+        )
 
     @property
     def target_temperature_high(self) -> float | None:
         if not self._use_range:
             return None
-        return self._temperature_for_display(self.thermostat.get(self._csp_key))
+        return temperature_for_display(
+            self.hass, self.thermostat.get(self._csp_key)
+        )
 
     @property
     def target_temperature(self) -> float | None:
         if self._use_range:
             return None
         if self._has_heat:
-            return self._temperature_for_display(self.thermostat.get(self._hsp_key))
-        return self._temperature_for_display(self.thermostat.get(self._csp_key))
+            return temperature_for_display(
+                self.hass, self.thermostat.get(self._hsp_key)
+            )
+        return temperature_for_display(
+            self.hass, self.thermostat.get(self._csp_key)
+        )
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Write setpoints for this schedule period only."""
