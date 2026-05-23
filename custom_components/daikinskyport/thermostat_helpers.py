@@ -3,8 +3,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.climate.const import PRECISION_TENTHS
 from homeassistant.const import UnitOfTemperature
+
+try:
+    from homeassistant.const import PRECISION_TENTHS
+except ImportError:  # Home Assistant < 2024.2
+    from homeassistant.components.climate.const import PRECISION_TENTHS
 from homeassistant.core import HomeAssistant
 from homeassistant.util.unit_conversion import TemperatureConverter
 

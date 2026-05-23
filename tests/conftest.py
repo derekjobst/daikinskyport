@@ -35,6 +35,7 @@ def _install_ha_stubs() -> None:
     ha_const.CONCENTRATION_MICROGRAMS_PER_CUBIC_METER = "µg/m³"
     ha_const.UnitOfPower = MagicMock(WATT="W")
     ha_const.UnitOfVolumeFlowRate = MagicMock(CUBIC_FEET_PER_MINUTE="ft³/min")
+    ha_const.PRECISION_TENTHS = 0.1
 
     ha_exceptions = types.ModuleType("homeassistant.exceptions")
     ha_exceptions.ConfigEntryNotReady = Exception
@@ -59,7 +60,6 @@ def _install_ha_stubs() -> None:
     ha_logbook = types.ModuleType("homeassistant.components.logbook")
     ha_logbook.async_log_entry = MagicMock()
     ha_climate_const = types.ModuleType("homeassistant.components.climate.const")
-    ha_climate_const.PRECISION_TENTHS = 0.1
     ha_weather = types.ModuleType("homeassistant.components.weather")
     for name in (
         "ATTR_CONDITION_CLEAR_NIGHT",
