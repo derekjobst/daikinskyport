@@ -1,7 +1,12 @@
 """Unit tests for optimistic hold-merge helpers."""
 from __future__ import annotations
 
-from daikinskyport.daikinskyport import _extract_temp_fields, _safe_body_for_log
+from daikinskyport.daikinskyport import (
+    DaikinSkyport,
+    _extract_temp_fields,
+    _parse_response_json,
+    _safe_body_for_log,
+)
 from daikinskyport.sync_helpers import pending_values_match
 
 
@@ -19,6 +24,25 @@ class TestPendingValuesMatch:
 
     def test_string_equality(self) -> None:
         assert pending_values_match("wake", "wake") is True
+
+
+class TestHttpClient:
+    def test_daikin_skyport_creates_reusable_session(self) -> None:
+        api = DaikinSkyport(
+            config={
+                "EMAIL": "a@b.com",
+                "PASSWORD": "secret",
+                "ACCESS_TOKEN": "access",
+                "REFRESH_TOKEN": "refresh",
+            }
+        )
+        assert api._session is not None
+
+    def test_parse_response_json_empty_body(self) -> None:
+        class _Response:
+            text = ""
+
+        assert _parse_response_json(_Response()) is None
 
 
 class TestApiLoggingHelpers:
